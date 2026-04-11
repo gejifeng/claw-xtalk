@@ -62,29 +62,22 @@ Design rules:
 
 ## Repository Layout
 
-```text
-claw-xtalk/
-  docs/
-    openclaw-xtalk-phase1-architecture.md
-    qwen3-asr-cosyvoice3-official-api-design.md
-  openclaw-extension-xtalk/
-    src/
-      adapters/
-      bridge/
-      types/
-      web/
-    package.json
-  xtalk-bridge-service/
-    app.py
-    websocket_server.py
-    xtalk_runtime.py
-    config/
-      config.py
-    scripts/
-      bootstrap_cosyvoice.py
-    requirements.txt
-    reference-audio/
-```
+- `docs/`
+  architecture notes and official API integration design
+- `openclaw-extension-xtalk/`
+  Node.js bridge service and browser UI
+  - `src/adapters/` provider-facing bridge adapters
+  - `src/bridge/` turn orchestration, interruption, and session mapping
+  - `src/web/` HTTP routes and in-browser voice UI
+  - `package.json` build and runtime entrypoints
+- `xtalk-bridge-service/`
+  Python speech sidecar
+  - `app.py` sidecar entrypoint
+  - `websocket_server.py` bridge protocol server
+  - `xtalk_runtime.py` ASR and TTS runtime implementations
+  - `config/config.py` runtime configuration loading
+  - `scripts/bootstrap_cosyvoice.py` optional local CosyVoice bootstrap helper
+  - `reference-audio/` local reference material placeholder
 
 ## Main Components
 
@@ -378,52 +371,6 @@ Recommended reading order:
 1. architecture doc
 2. official API migration doc
 3. this README for actual repository usage
-
-## Preparing This Repository for GitHub
-
-This workspace was built as an active development tree, so do a quick publish pass before the first push.
-
-### What should be committed
-
-- source code under `openclaw-extension-xtalk/src/`
-- source code under `xtalk-bridge-service/`
-- design docs under `docs/`
-- root `README.md`
-- root `.gitignore`
-- `xtalk-bridge-service/.env.example`
-
-### What should not be committed
-
-- real API keys
-- `xtalk-bridge-service/.env`
-- local reference audio
-- local Python environments such as `.venv/`
-- downloaded model weights under `xtalk-bridge-service/pretrained_models/`
-- vendored runtime checkout under `xtalk-bridge-service/vendor/`
-- generated JS build output under `openclaw-extension-xtalk/dist/`
-- `node_modules/`, caches, and `__pycache__/`
-
-### Suggested publish steps
-
-```bash
-git init
-git add README.md .gitignore docs openclaw-extension-xtalk xtalk-bridge-service
-git status
-```
-
-Before the first commit, double-check that staged content does not include:
-
-- secrets
-- model binaries
-- vendor mirrors
-- local debug artifacts
-
-### Recommended first GitHub release shape
-
-- keep this repository source-first
-- document cloud mode as the default happy path
-- treat local CosyVoice as optional advanced mode
-- add screenshots or a short demo GIF later rather than blocking the first push
 
 ## Roadmap After Alpha
 
