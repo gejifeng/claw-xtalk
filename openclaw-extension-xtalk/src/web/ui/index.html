@@ -1,0 +1,1663 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenClaw × X-Talk – 实时语音转写</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #111318;
+      --surface:   #1a1d24;
+      --surface2:  #22262f;
+      --border:    #2d3141;
+      --text:      #e8eaf0;
+      --dim:       #6b7280;
+      --user-bg:   #1a2a45;
+      --user-acc:  #4f8ef7;
+      --user-glow: rgba(79,142,247,.18);
+      --ai-bg:     #141e14;
+      --ai-acc:    #3ecf6c;
+      --ai-glow:   rgba(62,207,108,.15);
+      --warn:      #ef4444;
+      --amber:     #f59e0b;
+      --radius:    14px;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Inter", system-ui, "Segoe UI", sans-serif;
+      font-size: 14.5px;
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Top bar ── */
+    #topbar {
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+      padding: .75rem 1.4rem;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      backdrop-filter: blur(8px);
+    }
+    #topbar h1 {
+      font-size: .9rem;
+      font-weight: 600;
+      flex: 1;
+      letter-spacing: .015em;
+      background: linear-gradient(135deg, #a8c4ff 0%, #6ee7b7 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    /* ── Status pill ── */
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: .4rem;
+      font-size: .72rem;
+      font-weight: 500;
+      letter-spacing: .03em;
+      color: var(--dim);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: .28rem .8rem;
+      transition: border-color .3s, color .3s;
+    }
+    .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--border);
+      flex-shrink: 0;
+      transition: background .3s, box-shadow .3s;
+    }
+    .dot.idle         { background: var(--border); }
+    .dot.connecting   { background: var(--amber);  animation: pulse .9s infinite; }
+    .dot.listening    { background: var(--user-acc); box-shadow: 0 0 0 3px var(--user-glow); animation: pulse .9s infinite; }
+    .dot.transcribing { background: var(--amber);    animation: pulse .6s infinite; }
+    .dot.thinking     { background: var(--amber);    animation: blink .8s infinite; }
+    .dot.speaking     { background: var(--ai-acc);   box-shadow: 0 0 0 3px var(--ai-glow); animation: pulse .6s infinite; }
+    .dot.interrupted  { background: var(--warn); }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+    @keyframes blink { 0%,49%{opacity:1} 50%,100%{opacity:0} }
+
+    /* ── Chat area ── */
+    #chat-wrap {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.2rem 1.5rem .5rem;
+      display: flex;
+      flex-direction: column;
+      gap: .75rem;
+      scroll-behavior: smooth;
+    }
+    #chat-wrap::-webkit-scrollbar { width: 5px; }
+    #chat-wrap::-webkit-scrollbar-track { background: transparent; }
+    #chat-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── Message bubbles ── */
+    .msg {
+      max-width: 76%;
+      line-height: 1.65;
+      padding: .65rem 1rem;
+      border-radius: var(--radius);
+      font-size: .88rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      position: relative;
+      animation: fadeUp .18s ease-out;
+    }
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: none; }
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: var(--user-bg);
+      border: 1px solid rgba(79,142,247,.35);
+      border-bottom-right-radius: 4px;
+      box-shadow: 0 2px 12px var(--user-glow);
+    }
+    .msg.assistant {
+      align-self: flex-start;
+      background: var(--ai-bg);
+      border: 1px solid rgba(62,207,108,.3);
+      border-bottom-left-radius: 4px;
+      box-shadow: 0 2px 12px var(--ai-glow);
+    }
+    .msg .label {
+      font-size: .68rem;
+      font-weight: 600;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      margin-bottom: .3rem;
+      opacity: .55;
+    }
+    .msg.user .label      { color: var(--user-acc); }
+    .msg.assistant .label { color: var(--ai-acc); }
+
+    /* Live (in-progress) bubbles */
+    .msg.live { opacity: .9; }
+    .msg.live::after {
+      content: "▌";
+      animation: blink .8s step-start infinite;
+      margin-left: 2px;
+      color: var(--dim);
+    }
+    .msg.live.empty { display: none; }
+
+    /* ── Live area below chat ── */
+    #live-area {
+      padding: .4rem 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: .4rem;
+      flex-shrink: 0;
+    }
+
+    /* ── Divider ── */
+    #divider {
+      height: 1px;
+      background: var(--border);
+      flex-shrink: 0;
+      margin: 0 1.5rem;
+      opacity: .6;
+    }
+
+    /* ── Controls ── */
+    #controls {
+      display: flex;
+      gap: .6rem;
+      align-items: center;
+      padding: .85rem 1.4rem;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+    button {
+      display: inline-flex;
+      align-items: center;
+      gap: .4rem;
+      padding: .52rem 1.1rem;
+      border-radius: 9px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      cursor: pointer;
+      font-size: .82rem;
+      font-weight: 500;
+      font-family: inherit;
+      transition: background .15s, border-color .15s, box-shadow .15s, transform .1s;
+    }
+    button:hover:not(:disabled) {
+      background: var(--border);
+      transform: translateY(-1px);
+      box-shadow: 0 2px 8px rgba(0,0,0,.25);
+    }
+    button:active:not(:disabled) { transform: none; }
+    button:disabled { opacity: .3; cursor: default; }
+
+    #btn-start {
+      border-color: rgba(79,142,247,.5);
+      color: var(--user-acc);
+      background: rgba(79,142,247,.08);
+    }
+    #btn-start:hover:not(:disabled) {
+      background: rgba(79,142,247,.18);
+      border-color: var(--user-acc);
+      box-shadow: 0 2px 12px rgba(79,142,247,.2);
+    }
+    #btn-stop {
+      border-color: rgba(239,68,68,.4);
+      color: var(--warn);
+      background: rgba(239,68,68,.07);
+    }
+    #btn-stop:hover:not(:disabled) {
+      background: rgba(239,68,68,.15);
+      border-color: var(--warn);
+    }
+    #btn-debug.active {
+      border-color: rgba(245,158,11,.55);
+      color: var(--amber);
+      background: rgba(245,158,11,.09);
+      box-shadow: 0 2px 10px rgba(245,158,11,.14);
+    }
+
+    /* Volume meter */
+    #vol-meter {
+      flex: 1;
+      height: 4px;
+      border-radius: 2px;
+      background: var(--border);
+      overflow: hidden;
+    }
+    #vol-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--user-acc) 0%, #7dd3fc 100%);
+      border-radius: 2px;
+      transition: width .05s linear;
+    }
+
+    /* ── Debug panel ── */
+    #debug-panel {
+      display: none;
+      background: linear-gradient(180deg, rgba(26,29,36,.98) 0%, rgba(20,23,29,.98) 100%);
+      border-top: 1px solid var(--border);
+      max-height: 280px;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    #debug-panel.open { display: flex; flex-direction: column; }
+    #debug-toolbar {
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+      padding: .7rem 1rem;
+      border-bottom: 1px solid rgba(45,49,65,.65);
+      background: rgba(17,19,24,.7);
+    }
+    #debug-title {
+      font-size: .76rem;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--amber);
+      font-weight: 600;
+    }
+    #debug-status {
+      color: var(--dim);
+      font-size: .74rem;
+    }
+    #btn-debug-clear {
+      margin-left: auto;
+      padding: .36rem .75rem;
+      font-size: .74rem;
+    }
+    #debug-body {
+      display: grid;
+      grid-template-columns: minmax(260px, 340px) 1fr;
+      gap: 0;
+      min-height: 0;
+      flex: 1;
+    }
+    #debug-summary {
+      padding: .9rem 1rem 1rem;
+      border-right: 1px solid rgba(45,49,65,.65);
+      overflow-y: auto;
+      min-height: 0;
+    }
+    #debug-turns {
+      padding: .9rem 1rem 1rem;
+      overflow-y: auto;
+      overflow-x: hidden;
+      display: flex;
+      flex-direction: column;
+      gap: .75rem;
+      min-height: 0;
+      overscroll-behavior: contain;
+    }
+    #debug-summary::-webkit-scrollbar,
+    #debug-turns::-webkit-scrollbar { width: 6px; }
+    #debug-summary::-webkit-scrollbar-thumb,
+    #debug-turns::-webkit-scrollbar-thumb {
+      background: rgba(45,49,65,.9);
+      border-radius: 4px;
+    }
+    .debug-empty {
+      color: var(--dim);
+      font-size: .78rem;
+      line-height: 1.6;
+    }
+    .debug-kpi-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: .55rem;
+      margin-top: .75rem;
+    }
+    .debug-kpi {
+      border: 1px solid rgba(45,49,65,.65);
+      background: rgba(34,38,47,.45);
+      border-radius: 10px;
+      padding: .55rem .65rem;
+    }
+    .debug-kpi .label {
+      display: block;
+      color: var(--dim);
+      font-size: .69rem;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      margin-bottom: .25rem;
+    }
+    .debug-kpi .value {
+      display: block;
+      color: var(--text);
+      font-family: "SF Mono", "Fira Code", monospace;
+      font-size: .82rem;
+    }
+    .debug-turn {
+      border: 1px solid rgba(45,49,65,.75);
+      border-radius: 12px;
+      background: rgba(20,23,29,.72);
+      overflow: hidden;
+    }
+    .debug-history-item {
+      border: 1px solid rgba(45,49,65,.75);
+      border-radius: 12px;
+      background: rgba(20,23,29,.72);
+      padding: .72rem .8rem;
+      cursor: pointer;
+      transition: border-color .15s, background .15s, transform .1s, box-shadow .15s;
+    }
+    .debug-history-item:hover {
+      border-color: rgba(96,165,250,.45);
+      background: rgba(26,32,44,.84);
+      transform: translateY(-1px);
+    }
+    .debug-history-item.selected {
+      border-color: rgba(96,165,250,.7);
+      background: rgba(30,41,59,.92);
+      box-shadow: 0 4px 16px rgba(37,99,235,.18);
+    }
+    .debug-history-top {
+      display: flex;
+      align-items: center;
+      gap: .55rem;
+      margin-bottom: .4rem;
+    }
+    .debug-history-id {
+      font-size: .78rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .debug-history-status {
+      font-size: .7rem;
+      color: var(--dim);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .debug-history-time {
+      margin-left: auto;
+      font-size: .72rem;
+      color: var(--dim);
+      font-family: "SF Mono", "Fira Code", monospace;
+    }
+    .debug-history-text {
+      color: var(--text);
+      font-size: .76rem;
+      line-height: 1.5;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: .45rem;
+    }
+    .debug-history-metrics {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: .35rem .6rem;
+    }
+    .debug-history-metrics span {
+      font-size: .7rem;
+      color: var(--dim);
+      font-family: "SF Mono", "Fira Code", monospace;
+      white-space: nowrap;
+    }
+    .debug-turn-head {
+      display: flex;
+      align-items: center;
+      gap: .6rem;
+      padding: .68rem .8rem;
+      background: rgba(34,38,47,.52);
+      border-bottom: 1px solid rgba(45,49,65,.5);
+    }
+    .debug-turn-id {
+      font-size: .76rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .debug-turn-state {
+      font-size: .7rem;
+      color: var(--dim);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .debug-turn-time {
+      margin-left: auto;
+      font-size: .72rem;
+      color: var(--dim);
+      font-family: "SF Mono", "Fira Code", monospace;
+    }
+    .debug-turn-body {
+      padding: .8rem;
+      display: grid;
+      grid-template-columns: minmax(210px, 250px) 1fr;
+      gap: .8rem;
+    }
+    .debug-metrics,
+    .debug-events {
+      display: flex;
+      flex-direction: column;
+      gap: .4rem;
+      min-width: 0;
+    }
+    .debug-line {
+      display: flex;
+      justify-content: space-between;
+      gap: .75rem;
+      padding: .34rem .45rem;
+      border-radius: 8px;
+      background: rgba(34,38,47,.4);
+      font-size: .75rem;
+    }
+    .debug-line span:first-child {
+      color: var(--dim);
+    }
+    .debug-line span:last-child {
+      color: var(--text);
+      font-family: "SF Mono", "Fira Code", monospace;
+      white-space: nowrap;
+    }
+    .debug-event {
+      padding: .42rem .5rem;
+      border-radius: 8px;
+      background: rgba(17,19,24,.7);
+      border: 1px solid rgba(45,49,65,.42);
+      font-size: .74rem;
+      line-height: 1.45;
+    }
+    .debug-event-head {
+      display: flex;
+      justify-content: space-between;
+      gap: .75rem;
+      margin-bottom: .2rem;
+      color: var(--dim);
+      font-family: "SF Mono", "Fira Code", monospace;
+    }
+    .debug-event-detail {
+      color: var(--text);
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+    .debug-summary-detail {
+      margin-top: .8rem;
+      display: flex;
+      flex-direction: column;
+      gap: .8rem;
+    }
+    @media (max-width: 900px) {
+      #debug-body,
+      .debug-turn-body {
+        grid-template-columns: 1fr;
+      }
+      #debug-summary {
+        border-right: none;
+        border-bottom: 1px solid rgba(45,49,65,.65);
+      }
+    }
+
+    /* ── Log ── */
+    #log {
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      max-height: 72px;
+      overflow-y: auto;
+      flex-shrink: 0;
+    }
+    #log::-webkit-scrollbar { width: 4px; }
+    #log::-webkit-scrollbar-thumb { background: var(--border); }
+    #log-inner { padding: .25rem .9rem; display: flex; flex-direction: column-reverse; }
+    #log p {
+      border-bottom: 1px solid rgba(45,49,65,.5);
+      padding: .12rem 0;
+      font-size: .68rem;
+      color: var(--dim);
+      font-family: "SF Mono", "Fira Code", monospace;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Top bar -->
+<div id="topbar">
+  <h1>OpenClaw × X-Talk &nbsp;实时语音转写</h1>
+  <div class="status-pill">
+    <div class="dot idle" id="state-dot"></div>
+    <span id="state-label">disconnected</span>
+  </div>
+</div>
+
+<!-- Chat history + live bubbles -->
+<div id="chat-wrap" id="chat-scroll">
+  <!-- Historical turns injected here -->
+  <div id="chat-history"></div>
+
+  <!-- Live in-progress user bubble -->
+  <div class="msg user live empty" id="live-user">
+    <div class="label">你</div>
+    <span id="live-user-text"></span>
+  </div>
+
+  <!-- Live in-progress assistant bubble -->
+  <div class="msg assistant live empty" id="live-assistant">
+    <div class="label">AI</div>
+    <span id="live-assistant-text"></span>
+  </div>
+</div>
+
+<!-- Controls -->
+<div id="controls">
+  <button id="btn-start" disabled>🎙 开始说话</button>
+  <button id="btn-stop"  disabled>⏹ 停止 / 打断</button>
+  <button id="btn-reset" disabled>↺ 重置会话</button>
+  <button id="btn-debug">Debug: Off</button>
+  <div id="vol-meter"><div id="vol-bar"></div></div>
+</div>
+
+<div id="debug-panel">
+  <div id="debug-toolbar">
+    <span id="debug-title">Debug Timeline</span>
+    <span id="debug-status">记录浏览器侧每个阶段的耗时，用于定位瓶颈。</span>
+    <button id="btn-debug-clear">清空</button>
+  </div>
+  <div id="debug-body">
+    <div id="debug-summary"></div>
+    <div id="debug-turns"></div>
+  </div>
+</div>
+
+<!-- Log -->
+<div id="log"><div id="log-inner"></div></div>
+
+<script type="module">
+  // ──────────────────────────────────────────────────────────────
+  // Config
+  // ──────────────────────────────────────────────────────────────
+  const BRIDGE_WS   = `ws://${location.host}/ws`;
+  const SAMPLE_RATE = 16000;
+  const CHUNK_MS    = 60;   // audio chunk cadence
+  const LOCAL_SPEECH_RMS_THRESHOLD = 0.02;
+  const LOCAL_SPEECH_NOISE_MULTIPLIER = 2.4;
+  const LOCAL_SPEECH_NOISE_MARGIN = 0.004;
+  const LOCAL_SPEECH_START_CHUNKS = 2;
+  const LOCAL_SPEECH_END_SILENCE_CHUNKS = 8;
+  const LOCAL_BARGE_IN_RMS_THRESHOLD = 0.03;
+  const LOCAL_BARGE_IN_NOISE_MULTIPLIER = 3.2;
+  const LOCAL_BARGE_IN_NOISE_MARGIN = 0.008;
+  const LOCAL_BARGE_IN_CONSECUTIVE_CHUNKS = 4;
+  const LOCAL_BARGE_IN_PLAYBACK_GRACE_MS = 900;
+  const LOCAL_NOISE_FLOOR_EMA = 0.08;
+  const MIC_PREROLL_CHUNKS = 6;
+  const DEBUG_STORAGE_KEY = "xtalk-debug-enabled";
+  const DEBUG_MAX_TURNS = 12;
+  const DEBUG_FINALIZE_AFTER_ASSISTANT_MS = 800;
+
+  // ──────────────────────────────────────────────────────────────
+  // State
+  // ──────────────────────────────────────────────────────────────
+  let ws            = null;
+  let audioCtx      = null;
+  let mediaStream   = null;
+  let scriptNode    = null;
+  let analyser      = null;
+  let sinkNode      = null;
+  let volRaf        = null;
+  let isRecording   = false;
+  const browserSessionId = `b-${crypto.randomUUID()}`;
+    let playbackAudioCtx = null;
+  let playbackQueue = [];
+    let playbackDecodeInFlight = 0;
+    let playbackPendingSourceCount = 0;
+    let playbackScheduledUntil = 0;
+    let playbackGeneration = 0;
+    const playbackSources = new Set();
+  let playbackIsActive = false;
+  let pendingRemotePlaybackIdle = false;
+  let playbackInterruptSent = false;
+  let playbackLastStartedAt = 0;
+  let localSpeechChunkCount = 0;
+  let speechSegmentActive = false;
+  let localSpeechStartCount = 0;
+  let localSpeechSilenceCount = 0;
+  let localNoiseFloorRms = 0.006;
+  let bufferedMicChunks = [];
+
+  // Pending text for current live bubbles
+  let liveUserFinal    = "";  // confirmed final text in the live user bubble
+  let liveAssistant    = "";  // accumulated assistant deltas
+  let debugEnabled     = localStorage.getItem(DEBUG_STORAGE_KEY) === "1";
+  let debugTurnSeq     = 0;
+  let activeDebugTurn  = null;
+  let debugFinalizeTimer = null;
+  let selectedDebugTurnId = null;
+  const debugTurns     = [];
+
+  // ──────────────────────────────────────────────────────────────
+  // DOM refs
+  // ──────────────────────────────────────────────────────────────
+  const dot           = document.getElementById("state-dot");
+  const stateLabel    = document.getElementById("state-label");
+  const chatHistory   = document.getElementById("chat-history");
+  const liveUserEl    = document.getElementById("live-user");
+  const liveUserText  = document.getElementById("live-user-text");
+  const liveAiEl      = document.getElementById("live-assistant");
+  const liveAiText    = document.getElementById("live-assistant-text");
+  const volBar        = document.getElementById("vol-bar");
+  const btnStart      = document.getElementById("btn-start");
+  const btnStop       = document.getElementById("btn-stop");
+  const btnReset      = document.getElementById("btn-reset");
+  const btnDebug      = document.getElementById("btn-debug");
+  const btnDebugClear = document.getElementById("btn-debug-clear");
+  const logInner      = document.getElementById("log-inner");
+  const chatWrap      = document.getElementById("chat-wrap");
+  const debugPanel    = document.getElementById("debug-panel");
+  const debugSummary  = document.getElementById("debug-summary");
+  const debugTurnsEl  = document.getElementById("debug-turns");
+
+  // ──────────────────────────────────────────────────────────────
+  // UI helpers
+  // ──────────────────────────────────────────────────────────────
+  function setUIState(state) {
+    dot.className = `dot ${state}`;
+    stateLabel.textContent = state;
+  }
+
+  function log(msg) {
+    const p = document.createElement("p");
+    p.textContent = `[${new Date().toISOString().slice(11, 23)}] ${msg}`;
+    logInner.prepend(p);
+  }
+
+  function nowMs() {
+    return performance.now();
+  }
+
+  function fmtMs(value) {
+    return Number.isFinite(value) ? `${Math.round(value)} ms` : "--";
+  }
+
+  function relMs(turn, value) {
+    return Number.isFinite(value) && turn ? `${Math.round(value - turn.startedAt)} ms` : "--";
+  }
+
+  function wallClock() {
+    return new Date().toISOString().slice(11, 23);
+  }
+
+  function computeDuration(end, start) {
+    return Number.isFinite(end) && Number.isFinite(start) ? end - start : NaN;
+  }
+
+  function recordingBaseline(turn) {
+    return turn.recordingStartedAt ?? turn.startClickedAt ?? turn.startedAt;
+  }
+
+  function responseBaseline(turn) {
+    return turn.speechEndedPerfAt ?? recordingBaseline(turn);
+  }
+
+  function ensureDebugTurn(source) {
+    if (!debugEnabled) return null;
+    if (!activeDebugTurn || activeDebugTurn.done) {
+      activeDebugTurn = {
+        id: ++debugTurnSeq,
+        source,
+        status: "pending",
+        startedAt: nowMs(),
+        startedClock: wallClock(),
+        partialCount: 0,
+        deltaCount: 0,
+        events: [],
+        userText: "",
+        assistantText: "",
+        done: false,
+      };
+      debugTurns.unshift(activeDebugTurn);
+      selectedDebugTurnId = activeDebugTurn.id;
+      if (debugTurns.length > DEBUG_MAX_TURNS) {
+        debugTurns.length = DEBUG_MAX_TURNS;
+      }
+    }
+    return activeDebugTurn;
+  }
+
+  function pushDebugEventToTurn(turn, label, detail = "") {
+    if (!debugEnabled || !turn) return;
+    turn.events.unshift({ at: nowMs(), clock: wallClock(), label, detail });
+    if (turn.events.length > 14) turn.events.length = 14;
+    renderDebugPanel();
+  }
+
+  function pushDebugEvent(label, detail = "", createTurn = true) {
+    if (!debugEnabled) return;
+    const turn = createTurn ? ensureDebugTurn("event") : activeDebugTurn;
+    if (!turn) return;
+    pushDebugEventToTurn(turn, label, detail);
+  }
+
+  function markDebugTime(key, label, detail = "") {
+    const turn = ensureDebugTurn(label);
+    if (!turn) return null;
+    if (!Number.isFinite(turn[key])) {
+      turn[key] = nowMs();
+      pushDebugEventToTurn(turn, label, detail);
+    }
+    return turn;
+  }
+
+  function finalizeDebugTurn(status, detail = "") {
+    if (!debugEnabled || !activeDebugTurn || activeDebugTurn.done) return;
+    if (debugFinalizeTimer) {
+      clearTimeout(debugFinalizeTimer);
+      debugFinalizeTimer = null;
+    }
+    pushDebugEventToTurn(activeDebugTurn, `turn.${status}`, detail);
+    activeDebugTurn.status = status;
+    activeDebugTurn.done = true;
+    activeDebugTurn.finishedAt = nowMs();
+    renderDebugPanel();
+  }
+
+  function scheduleDebugFinalizeAfterAssistant() {
+    if (!debugEnabled || !activeDebugTurn) return;
+    if (debugFinalizeTimer) {
+      clearTimeout(debugFinalizeTimer);
+    }
+    const turnRef = activeDebugTurn;
+    debugFinalizeTimer = setTimeout(() => {
+      debugFinalizeTimer = null;
+      if (!activeDebugTurn || activeDebugTurn !== turnRef || activeDebugTurn.done) return;
+      if (activeDebugTurn.playbackStartedAt) return;
+      finalizeDebugTurn("completed", "assistant.final 后未进入 playback，自动收口");
+    }, DEBUG_FINALIZE_AFTER_ASSISTANT_MS);
+  }
+
+  function metricRows(turn) {
+    const recordingStartAt = recordingBaseline(turn);
+    const responseStartAt = responseBaseline(turn);
+    return [
+      ["浏览器音频初始化", computeDuration(turn.recordingStartedAt, turn.startClickedAt)],
+      ["首个 STT partial", computeDuration(turn.firstPartialAt, recordingStartAt)],
+      ["STT final", turn.serverSttLatencyMs ?? computeDuration(turn.asrFinalAt, responseStartAt)],
+      ["Agent 首字延迟", computeDuration(turn.firstAssistantDeltaAt, responseStartAt)],
+      ["Agent 完整回复", computeDuration(turn.assistantFinalAt, responseStartAt)],
+      ["播放启动", computeDuration(turn.playbackStartedAt, responseStartAt)],
+      ["播放时长", computeDuration(turn.playbackFinishedAt, turn.playbackStartedAt)],
+      [
+        "端到端",
+        computeDuration(
+          turn.playbackFinishedAt || turn.assistantFinalAt || turn.finishedAt,
+          responseStartAt,
+        ),
+      ],
+    ];
+  }
+
+  function selectedDebugTurn() {
+    return debugTurns.find((turn) => turn.id === selectedDebugTurnId) ?? debugTurns[0] ?? null;
+  }
+
+  function renderDebugPanel() {
+    debugPanel.classList.toggle("open", debugEnabled);
+    btnDebug.textContent = debugEnabled ? "Debug: On" : "Debug: Off";
+    btnDebug.classList.toggle("active", debugEnabled);
+    if (!debugEnabled) return;
+
+    const selected = selectedDebugTurn();
+    const latest = debugTurns[0];
+    if (!selected) {
+      debugSummary.innerHTML = `<div class="debug-empty">等待一次完整交互。建议流程：开始说话 → 等待 STT final → 等待 AI delta/final。</div>`;
+      debugTurnsEl.innerHTML = `<div class="debug-empty">暂无调试记录。</div>`;
+      return;
+    }
+
+    debugSummary.innerHTML = `
+      <div class="debug-turn-id">当前查看 #${selected.id}</div>
+      <div class="debug-turn-state">${escHtml(selected.status)} · ${escHtml(selected.startedClock)}${latest ? ` · 最新 #${latest.id}` : ""}</div>
+      <div class="debug-kpi-grid">
+        <div class="debug-kpi"><span class="label">用户文本</span><span class="value">${escHtml((selected.userText || "--").slice(0, 60))}</span></div>
+        <div class="debug-kpi"><span class="label">AI 文本长度</span><span class="value">${selected.assistantText ? `${selected.assistantText.length} chars` : "--"}</span></div>
+        <div class="debug-kpi"><span class="label">STT Partial 次数</span><span class="value">${selected.partialCount}</span></div>
+        <div class="debug-kpi"><span class="label">AI Delta 次数</span><span class="value">${selected.deltaCount}</span></div>
+      </div>
+      <div class="debug-summary-detail">
+        <div class="debug-metrics">
+          ${metricRows(selected).map(([label, value]) => `
+            <div class="debug-line"><span>${label}</span><span>${fmtMs(value)}</span></div>
+          `).join("")}
+        </div>
+        <div class="debug-events">
+          ${(selected.events || []).map((event) => `
+            <div class="debug-event">
+              <div class="debug-event-head"><span>${escHtml(event.label)}</span><span>${relMs(selected, event.at)}</span></div>
+              <div class="debug-event-detail">${escHtml(event.detail || event.clock)}</div>
+            </div>
+          `).join("") || `<div class="debug-empty">暂无事件。</div>`}
+        </div>
+      </div>
+    `;
+
+    debugTurnsEl.innerHTML = debugTurns.map((turn) => `
+      <div class="debug-history-item ${turn.id === selected.id ? "selected" : ""}" data-debug-turn-id="${turn.id}">
+        <div class="debug-history-top">
+          <span class="debug-history-id">#${turn.id}</span>
+          <span class="debug-history-status">${escHtml(turn.status)}</span>
+          <span class="debug-history-time">${escHtml(turn.startedClock)}</span>
+        </div>
+        <div class="debug-history-text">${escHtml(turn.userText || turn.assistantText || "暂无文本")}</div>
+        <div class="debug-history-metrics">
+          <span>STT ${fmtMs(turn.serverSttLatencyMs ?? computeDuration(turn.asrFinalAt, responseBaseline(turn)))}</span>
+          <span>首字 ${fmtMs(computeDuration(turn.firstAssistantDeltaAt, responseBaseline(turn)))}</span>
+          <span>完成 ${fmtMs(computeDuration(turn.assistantFinalAt, responseBaseline(turn)))}</span>
+          <span>总计 ${fmtMs(computeDuration(turn.playbackFinishedAt || turn.assistantFinalAt || turn.finishedAt, responseBaseline(turn)))}</span>
+        </div>
+      </div>
+    `).join("");
+  }
+
+  function resetDebugPanel() {
+    if (debugFinalizeTimer) {
+      clearTimeout(debugFinalizeTimer);
+      debugFinalizeTimer = null;
+    }
+    activeDebugTurn = null;
+    selectedDebugTurnId = null;
+    debugTurns.length = 0;
+    renderDebugPanel();
+  }
+
+  function setDebugEnabled(enabled) {
+    debugEnabled = enabled;
+    localStorage.setItem(DEBUG_STORAGE_KEY, enabled ? "1" : "0");
+    renderDebugPanel();
+  }
+
+  function describeMicError(err) {
+    const name = err?.name || "UnknownError";
+    const message = err?.message || "unknown microphone error";
+    switch (name) {
+      case "NotAllowedError":
+      case "PermissionDeniedError":
+        return `麦克风权限被拒绝: ${message}`;
+      case "NotFoundError":
+      case "DevicesNotFoundError":
+        return `未检测到可用麦克风: ${message}`;
+      case "NotReadableError":
+      case "TrackStartError":
+        return `麦克风无法启动，通常是设备被占用或系统音频源异常: ${message}`;
+      case "AbortError":
+        return `浏览器启动麦克风时中断: ${message}`;
+      default:
+        return `麦克风启动失败 [${name}]: ${message}`;
+    }
+  }
+
+  function downsampleToInt16(float32, inputRate, outputRate) {
+    if (inputRate === outputRate) {
+      const pcm = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        pcm[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
+      }
+      return pcm;
+    }
+
+    const ratio = inputRate / outputRate;
+    const outLen = Math.max(1, Math.round(float32.length / ratio));
+    const pcm = new Int16Array(outLen);
+    let outIndex = 0;
+    let inIndex = 0;
+
+    while (outIndex < outLen) {
+      const nextIndex = Math.min(float32.length, Math.round((outIndex + 1) * ratio));
+      let sum = 0;
+      let count = 0;
+      for (let i = inIndex; i < nextIndex; i++) {
+        sum += float32[i];
+        count++;
+      }
+      const sample = count > 0 ? sum / count : float32[Math.min(inIndex, float32.length - 1)] || 0;
+      pcm[outIndex] = Math.max(-32768, Math.min(32767, sample * 32768));
+      outIndex++;
+      inIndex = nextIndex;
+    }
+    return pcm;
+  }
+
+  function computeRms(float32) {
+    if (!float32 || float32.length === 0) return 0;
+    let sum = 0;
+    for (let i = 0; i < float32.length; i++) {
+      sum += float32[i] * float32[i];
+    }
+    return Math.sqrt(sum / float32.length);
+  }
+
+  function hasPendingPlayback() {
+    return playbackIsActive || playbackQueue.length > 0 || playbackDecodeInFlight > 0 || playbackPendingSourceCount > 0;
+  }
+
+  function updateLocalNoiseFloor(rms) {
+    if (!Number.isFinite(rms) || rms <= 0) return;
+    if (speechSegmentActive || hasPendingPlayback()) return;
+    const clamped = Math.min(rms, LOCAL_BARGE_IN_RMS_THRESHOLD);
+    localNoiseFloorRms = localNoiseFloorRms > 0
+      ? ((1 - LOCAL_NOISE_FLOOR_EMA) * localNoiseFloorRms) + (LOCAL_NOISE_FLOOR_EMA * clamped)
+      : clamped;
+  }
+
+  function getSpeechStartThreshold() {
+    return Math.max(
+      LOCAL_SPEECH_RMS_THRESHOLD,
+      (localNoiseFloorRms * LOCAL_SPEECH_NOISE_MULTIPLIER) + LOCAL_SPEECH_NOISE_MARGIN,
+    );
+  }
+
+  function getBargeInThreshold() {
+    return Math.max(
+      LOCAL_BARGE_IN_RMS_THRESHOLD,
+      (localNoiseFloorRms * LOCAL_BARGE_IN_NOISE_MULTIPLIER) + LOCAL_BARGE_IN_NOISE_MARGIN,
+    );
+  }
+
+  function shouldGateMicDuringPlayback() {
+    return isRecording && hasPendingPlayback();
+  }
+
+  function clearBufferedMicChunks() {
+    bufferedMicChunks = [];
+  }
+
+  function bufferMicChunk(buffer) {
+    bufferedMicChunks.push(buffer);
+    if (bufferedMicChunks.length > MIC_PREROLL_CHUNKS) {
+      bufferedMicChunks.shift();
+    }
+  }
+
+  function flushBufferedMicChunks() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      clearBufferedMicChunks();
+      return;
+    }
+    for (const chunk of bufferedMicChunks) {
+      ws.send(chunk);
+    }
+    clearBufferedMicChunks();
+  }
+
+  function resetSpeechSegmentTracking(options = {}) {
+    const { preservePreroll = false } = options;
+    speechSegmentActive = false;
+    localSpeechStartCount = 0;
+    localSpeechSilenceCount = 0;
+    if (!preservePreroll) clearBufferedMicChunks();
+  }
+
+  function beginSpeechSegment(reason) {
+    if (!isRecording || speechSegmentActive) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    speechSegmentActive = true;
+    localSpeechStartCount = 0;
+    localSpeechSilenceCount = 0;
+    ws.send(JSON.stringify({ type: "audio.start" }));
+    flushBufferedMicChunks();
+    pushDebugEvent("audio.segment.start", reason);
+    log(`speech segment started: ${reason}`);
+    setUIState("listening");
+  }
+
+  function endSpeechSegment(reason) {
+    if (!speechSegmentActive) {
+      localSpeechStartCount = 0;
+      localSpeechSilenceCount = 0;
+      clearBufferedMicChunks();
+      return;
+    }
+    speechSegmentActive = false;
+    localSpeechStartCount = 0;
+    localSpeechSilenceCount = 0;
+    clearBufferedMicChunks();
+    ws?.send(JSON.stringify({ type: "audio.stop" }));
+    pushDebugEvent("audio.segment.stop", reason);
+    log(`speech segment stopped: ${reason}`);
+    setUIState("transcribing");
+  }
+
+  function handleLocalSpeechChunk(audioBuffer, rms) {
+    const startThreshold = getSpeechStartThreshold();
+    const speechLike = rms >= startThreshold;
+
+    if (!speechSegmentActive) {
+      bufferMicChunk(audioBuffer);
+      if (!speechLike) {
+        localSpeechStartCount = 0;
+        return;
+      }
+      localSpeechStartCount += 1;
+      if (localSpeechStartCount < LOCAL_SPEECH_START_CHUNKS) return;
+      beginSpeechSegment(`rms=${rms.toFixed(3)} threshold=${startThreshold.toFixed(3)}`);
+      return;
+    }
+
+    ws.send(audioBuffer);
+    if (speechLike) {
+      localSpeechSilenceCount = 0;
+      return;
+    }
+
+    localSpeechSilenceCount += 1;
+    if (localSpeechSilenceCount >= LOCAL_SPEECH_END_SILENCE_CHUNKS) {
+      endSpeechSegment("local silence");
+    }
+  }
+
+  function maybeInterruptForLocalSpeech(rms) {
+    if (!isRecording) return;
+    if (playbackInterruptSent) return;
+    if (!hasPendingPlayback()) return;
+    if (nowMs() - playbackLastStartedAt < LOCAL_BARGE_IN_PLAYBACK_GRACE_MS) return;
+
+    const bargeInThreshold = getBargeInThreshold();
+
+    if (rms >= bargeInThreshold) {
+      localSpeechChunkCount += 1;
+    } else {
+      localSpeechChunkCount = 0;
+      return;
+    }
+
+    if (localSpeechChunkCount < LOCAL_BARGE_IN_CONSECUTIVE_CHUNKS) return;
+    playbackInterruptSent = true;
+    localSpeechChunkCount = 0;
+    log(`local barge-in detected rms=${rms.toFixed(3)} threshold=${bargeInThreshold.toFixed(3)} noise=${localNoiseFloorRms.toFixed(3)}`);
+    pushDebugEvent("interrupt.local", `浏览器本地检测到插话 rms=${rms.toFixed(3)} threshold=${bargeInThreshold.toFixed(3)} noise=${localNoiseFloorRms.toFixed(3)}`);
+    stopPlaybackQueue({ preserveMicPreroll: true, preserveInterruptFlag: true });
+    ws?.send(JSON.stringify({ type: "playback.stop" }));
+    setUIState("interrupted");
+  }
+
+  function decodeBase64Audio(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  }
+
+  function ensurePlaybackAudioContext() {
+    if (playbackAudioCtx && playbackAudioCtx.state !== "closed") return playbackAudioCtx;
+    playbackAudioCtx = new AudioContext();
+    playbackScheduledUntil = 0;
+    return playbackAudioCtx;
+  }
+
+  async function decodePlaybackChunk(ctx, audioBuffer) {
+    const encoded = decodeBase64Audio(audioBuffer);
+    return await ctx.decodeAudioData(encoded);
+  }
+
+  function handlePlaybackSourceEnded(source, generation) {
+    playbackSources.delete(source);
+    try {
+      source.disconnect();
+    } catch {}
+    if (generation !== playbackGeneration) return;
+    playbackPendingSourceCount = Math.max(0, playbackPendingSourceCount - 1);
+    if (playbackPendingSourceCount === 0) {
+      playbackIsActive = false;
+      if (playbackAudioCtx && playbackAudioCtx.state !== "closed") {
+        playbackScheduledUntil = playbackAudioCtx.currentTime;
+      } else {
+        playbackScheduledUntil = 0;
+      }
+    }
+    applyPlaybackIdleIfReady();
+  }
+
+  function resetPlaybackScheduling() {
+    playbackGeneration += 1;
+    playbackPendingSourceCount = 0;
+    playbackScheduledUntil = 0;
+    playbackQueue = [];
+    for (const source of playbackSources) {
+      source.onended = null;
+      try {
+        source.stop();
+      } catch {}
+      try {
+        source.disconnect();
+      } catch {}
+    }
+    playbackSources.clear();
+    playbackIsActive = false;
+    playbackLastStartedAt = 0;
+  }
+
+  function applyPlaybackIdleIfReady() {
+    if (!pendingRemotePlaybackIdle) return;
+    if (hasPendingPlayback()) return;
+    pendingRemotePlaybackIdle = false;
+    clearBufferedMicChunks();
+    const turn = markDebugTime("playbackFinishedAt", "playback.local.idle", "浏览器音频播放完成");
+    if (turn && !turn.done) {
+      finalizeDebugTurn("completed", "browser playback queue drained");
+    }
+    setUIState("idle");
+  }
+
+  async function maybeStartNextPlaybackChunk() {
+    if (playbackDecodeInFlight > 0) return;
+    if (playbackQueue.length === 0) {
+      applyPlaybackIdleIfReady();
+      return;
+    }
+
+    const ctx = ensurePlaybackAudioContext();
+    const chunk = playbackQueue.shift();
+    const generation = playbackGeneration;
+    playbackDecodeInFlight += 1;
+
+    try {
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+      const decoded = await decodePlaybackChunk(ctx, chunk.audioBase64);
+      if (generation !== playbackGeneration) return;
+
+      const source = ctx.createBufferSource();
+      source.buffer = decoded;
+      source.connect(ctx.destination);
+
+      const startAt = Math.max(ctx.currentTime, playbackScheduledUntil);
+      playbackScheduledUntil = startAt + decoded.duration;
+      playbackPendingSourceCount += 1;
+      playbackIsActive = true;
+      playbackSources.add(source);
+      source.onended = () => handlePlaybackSourceEnded(source, generation);
+      source.start(startAt);
+
+      if (debugFinalizeTimer) {
+        clearTimeout(debugFinalizeTimer);
+        debugFinalizeTimer = null;
+      }
+      if (playbackPendingSourceCount === 1) {
+        playbackLastStartedAt = nowMs();
+        const turn = markDebugTime("playbackStartedAt", "playback.local.start", "浏览器开始播报 TTS 音频");
+        if (turn) turn.status = "playback";
+        setUIState("speaking");
+      }
+    } catch (err) {
+      log(`TTS 播放启动失败: ${err?.message || err}`);
+    }
+    finally {
+      playbackDecodeInFlight = Math.max(0, playbackDecodeInFlight - 1);
+      void maybeStartNextPlaybackChunk();
+      applyPlaybackIdleIfReady();
+    }
+  }
+
+  function enqueuePlaybackChunk(audioBase64, mimeType) {
+    playbackQueue.push({ audioBase64, mimeType: mimeType || "audio/wav" });
+    playbackInterruptSent = false;
+    void maybeStartNextPlaybackChunk();
+  }
+
+  function stopPlaybackQueue(options = {}) {
+    const {
+      preserveMicPreroll = false,
+      preserveInterruptFlag = false,
+    } = options;
+    pendingRemotePlaybackIdle = false;
+    if (!preserveInterruptFlag) playbackInterruptSent = false;
+    localSpeechChunkCount = 0;
+    if (!preserveMicPreroll) clearBufferedMicChunks();
+    resetPlaybackScheduling();
+  }
+
+  function setButtons(connected) {
+    btnStart.disabled = !connected;
+    btnStop.disabled  = !connected;
+    btnReset.disabled = !connected;
+  }
+
+  function scrollBottom() {
+    chatWrap.scrollTop = chatWrap.scrollHeight;
+  }
+
+  // ── Live bubble helpers ──────────────────────────────────────
+
+  function showLiveUser(text) {
+    liveUserText.textContent = text;
+    liveUserEl.classList.remove("empty");
+    scrollBottom();
+  }
+
+  function hideLiveUser() {
+    liveUserEl.classList.add("empty");
+    liveUserText.textContent = "";
+    liveUserFinal = "";
+  }
+
+  function showLiveAssistant(text) {
+    liveAiText.textContent = text;
+    liveAiEl.classList.remove("empty");
+    scrollBottom();
+  }
+
+  function hideLiveAssistant() {
+    liveAiEl.classList.add("empty");
+    liveAiText.textContent = "";
+    liveAssistant = "";
+  }
+
+  // Commit a finished bubble to the history
+  function commitUserTurn(text) {
+    if (!text.trim()) return;
+    const div = document.createElement("div");
+    div.className = "msg user";
+    div.innerHTML = `<div class="label">你</div>${escHtml(text)}`;
+    chatHistory.appendChild(div);
+    scrollBottom();
+  }
+
+  function commitAssistantTurn(text) {
+    if (!text.trim()) return;
+    const div = document.createElement("div");
+    div.className = "msg assistant";
+    div.innerHTML = `<div class="label">AI</div>${escHtml(text)}`;
+    chatHistory.appendChild(div);
+    scrollBottom();
+  }
+
+  function escHtml(s) {
+    return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // WebSocket
+  // ──────────────────────────────────────────────────────────────
+  function connectWS() {
+    log(`connecting to ${BRIDGE_WS}…`);
+    setUIState("connecting");
+    ws = new WebSocket(BRIDGE_WS);
+
+    ws.addEventListener("open", () => {
+      log("WS connected");
+      pushDebugEvent("ws.open", BRIDGE_WS, false);
+      ws.send(JSON.stringify({ type: "session.init", browserSessionId }));
+    });
+
+    ws.addEventListener("message", ev => {
+      if (typeof ev.data !== "string") return;
+      try { handleMsg(JSON.parse(ev.data)); } catch { /* binary/ignore */ }
+    });
+
+    ws.addEventListener("close", () => {
+      log("WS disconnected – retry in 3 s");
+      pushDebugEvent("ws.close", "3s 后自动重连", false);
+      setUIState("idle");
+      setButtons(false);
+      stopPlaybackQueue();
+      stopRecording();
+      hideLiveUser();
+      hideLiveAssistant();
+      setTimeout(connectWS, 3000);
+    });
+
+    ws.addEventListener("error", e => log(`WS error: ${e.type}`));
+  }
+
+  function handleMsg(msg) {
+    switch (msg.type) {
+
+      // ── Session ready ──────────────────────────────────────────
+      case "session.ready":
+        log(`session ready xid=${msg.xtalkSessionId}`);
+        pushDebugEvent(
+          "session.ready",
+          `xtalk=${msg.xtalkSessionId} openclaw=${msg.openclawSessionKey}`,
+          false,
+        );
+        setUIState("idle");
+        setButtons(true);
+        break;
+
+      // ── ASR: partial (live update while user speaks) ───────────
+      case "asr.partial":
+        {
+          const turn = markDebugTime("firstPartialAt", "asr.partial", msg.text);
+          if (turn) {
+            if (!Number.isFinite(turn.recordingStartedAt)) {
+              turn.recordingStartedAt = turn.startClickedAt ?? turn.startedAt;
+            }
+            turn.partialCount += 1;
+          }
+        }
+        setUIState("transcribing");
+        // Show final confirmed text + italic partial
+        showLiveUser(
+          liveUserFinal
+            ? `${liveUserFinal}\n${msg.text}`
+            : msg.text
+        );
+        break;
+
+      // ── ASR: final (speech segment recognized) ─────────────────
+      case "asr.final":
+        {
+          const turn = markDebugTime("asrFinalAt", "asr.final", msg.text);
+          if (turn) {
+            if (!Number.isFinite(turn.recordingStartedAt)) {
+              turn.recordingStartedAt = turn.startClickedAt ?? turn.startedAt;
+            }
+            if (msg.timing?.sttLatencyMs != null) {
+              turn.serverSttLatencyMs = msg.timing.sttLatencyMs;
+              turn.endpointWaitMs = msg.timing.endpointWaitMs;
+              turn.transcribeDurationMs = msg.timing.transcribeDurationMs;
+              turn.speechEndedPerfAt = turn.asrFinalAt - msg.timing.sttLatencyMs;
+            }
+            turn.userText = msg.text;
+            turn.status = "thinking";
+          }
+        }
+        // Commit user turn to history immediately – don't wait for agent
+        commitUserTurn(msg.text);
+        hideLiveUser();
+        liveUserFinal = msg.text;  // keep for interrupt recovery
+        setUIState("thinking");
+        break;
+
+      case "asr.ignored":
+        log(`ignored filler transcript: ${msg.text || "<empty>"}`);
+        pushDebugEvent("asr.ignored", `${msg.reason}: ${msg.text || "<empty>"}`);
+        hideLiveUser();
+        liveUserFinal = "";
+        setUIState("listening");
+        break;
+
+      // ── Assistant streaming delta ──────────────────────────────
+      case "assistant.delta":
+        {
+          const turn = markDebugTime("firstAssistantDeltaAt", "assistant.delta", msg.text);
+          if (turn) {
+            turn.deltaCount += 1;
+            turn.assistantText += msg.text;
+            turn.status = "speaking";
+          }
+        }
+        liveAssistant += msg.text;
+        showLiveAssistant(liveAssistant);
+        setUIState("speaking");
+        break;
+
+      // ── Assistant final ────────────────────────────────────────
+      case "assistant.final": {
+        {
+          const turn = markDebugTime("assistantFinalAt", "assistant.final", msg.text);
+          if (turn) {
+            turn.assistantText = liveAssistant || msg.text || turn.assistantText;
+            turn.status = "agent-final";
+          }
+        }
+        // User turn already committed on asr.final; just commit AI turn
+        const finalText = liveAssistant || msg.text;
+        if (finalText) {
+          commitAssistantTurn(finalText);
+          hideLiveAssistant();
+        }
+        liveUserFinal = "";
+        setUIState("idle");
+        scheduleDebugFinalizeAfterAssistant();
+        break;
+      }
+
+      case "tts.audio":
+        enqueuePlaybackChunk(msg.audioBase64, msg.mimeType);
+        break;
+
+      // ── Playback state ─────────────────────────────────────────
+      case "playback.state":
+        if (msg.state === "speaking") {
+          if (debugFinalizeTimer) {
+            clearTimeout(debugFinalizeTimer);
+            debugFinalizeTimer = null;
+          }
+        }
+        if (msg.state === "idle") {
+          pendingRemotePlaybackIdle = true;
+          applyPlaybackIdleIfReady();
+          break;
+        }
+        if (!hasPendingPlayback()) {
+          setUIState(msg.state);
+        }
+        break;
+
+      // ── Barge-in / interrupt ───────────────────────────────────
+      case "interrupt.detected":
+        log("interrupt detected");
+        pushDebugEvent("interrupt.detected", "用户打断或 barge-in");
+        stopPlaybackQueue();
+        setUIState("interrupted");
+        // Move any partial assistant text to history as interrupted
+        if (liveAssistant) {
+          commitAssistantTurn(liveAssistant + "…[中断]");
+          hideLiveAssistant();
+        }
+        // Keep user live bubble for the new utterance
+        liveUserFinal = "";
+        hideLiveUser();
+        setUIState(speechSegmentActive ? "listening" : "interrupted");
+        finalizeDebugTurn("interrupted", "收到 interrupt.detected");
+        break;
+
+      // ── Errors ────────────────────────────────────────────────
+      case "error":
+        log(`Error [${msg.code}]: ${msg.message}`);
+        pushDebugEvent(`error.${msg.code}`, msg.message);
+        finalizeDebugTurn("error", `${msg.code}: ${msg.message}`);
+        break;
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // Audio capture – PCM int16 mono 16 kHz
+  // ──────────────────────────────────────────────────────────────
+  async function startRecording() {
+    if (isRecording) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+    } catch (err) {
+      log(describeMicError(err));
+      return;
+    }
+
+    try {
+      audioCtx = new AudioContext();
+      await audioCtx.resume();
+
+      const source = audioCtx.createMediaStreamSource(mediaStream);
+      const track = mediaStream.getAudioTracks()[0];
+      const settings = track?.getSettings?.() ?? {};
+
+      // Analyser for volume meter
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+
+      // ScriptProcessor for PCM capture. Capture at native rate and downsample to 16 kHz.
+      const nativeRate = audioCtx.sampleRate || SAMPLE_RATE;
+      const bufferSize = Math.max(1024, Math.pow(2, Math.ceil(Math.log2(nativeRate * CHUNK_MS / 1000))));
+      scriptNode = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+      sinkNode = audioCtx.createGain();
+      sinkNode.gain.value = 0;
+
+      scriptNode.onaudioprocess = ev => {
+        if (!isRecording || ws?.readyState !== WebSocket.OPEN) return;
+        const f32 = ev.inputBuffer.getChannelData(0);
+        const rms = computeRms(f32);
+        updateLocalNoiseFloor(rms);
+        const i16 = downsampleToInt16(f32, nativeRate, SAMPLE_RATE);
+        const audioBuffer = i16.buffer.slice(0);
+        if (shouldGateMicDuringPlayback()) {
+          bufferMicChunk(audioBuffer);
+          maybeInterruptForLocalSpeech(rms);
+          return;
+        }
+        handleLocalSpeechChunk(audioBuffer, rms);
+      };
+
+      analyser.connect(scriptNode);
+      scriptNode.connect(sinkNode);
+      sinkNode.connect(audioCtx.destination);
+
+      log(`mic ready: browser=${settings.sampleRate || nativeRate}Hz → sidecar=${SAMPLE_RATE}Hz`);
+    } catch (err) {
+      log(`音频处理链启动失败: ${describeMicError(err)}`);
+      mediaStream?.getTracks().forEach(t => t.stop());
+      mediaStream = null;
+      audioCtx?.close();
+      audioCtx = null;
+      scriptNode = null;
+      analyser = null;
+      sinkNode = null;
+      return;
+    }
+
+    isRecording = true;
+    resetSpeechSegmentTracking();
+    {
+      const turn = markDebugTime("recordingStartedAt", "mic.capture.start", `browserSessionId=${browserSessionId}`);
+      if (turn) turn.status = "recording";
+    }
+    log("mic capture started – waiting for speech");
+    startVolMeter();
+  }
+
+  function stopRecording() {
+    if (!isRecording) return;
+    endSpeechSegment("manual stop");
+    isRecording = false;
+    resetSpeechSegmentTracking();
+    pushDebugEvent("audio.stop", "用户停止录音");
+    cancelAnimationFrame(volRaf);
+    volBar.style.width = "0%";
+    scriptNode?.disconnect();
+    analyser?.disconnect();
+    sinkNode?.disconnect();
+    mediaStream?.getTracks().forEach(t => t.stop());
+    audioCtx?.close();
+    scriptNode = null; analyser = null; sinkNode = null; mediaStream = null; audioCtx = null;
+    log("recording stopped");
+  }
+
+  function startVolMeter() {
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    function tick() {
+      if (!isRecording) return;
+      analyser.getByteFrequencyData(data);
+      const avg = data.reduce((a, b) => a + b, 0) / data.length;
+      volBar.style.width = `${Math.min(100, avg * 2.5)}%`;
+      volRaf = requestAnimationFrame(tick);
+    }
+    volRaf = requestAnimationFrame(tick);
+  }
+
+  // ──────────────────────────────────────────────────────────────
+  // Button handlers
+  // ──────────────────────────────────────────────────────────────
+  btnStart.addEventListener("click", async () => {
+    if (isRecording) return;
+    if (debugEnabled && activeDebugTurn && !activeDebugTurn.done) {
+      finalizeDebugTurn(
+        activeDebugTurn.assistantFinalAt ? "completed" : "abandoned",
+        "新的录音开始，收口上一轮调试记录",
+      );
+    }
+    {
+      const turn = ensureDebugTurn("button.start");
+      if (turn) {
+        turn.startClickedAt = nowMs();
+        turn.status = "starting";
+      }
+      pushDebugEvent("button.start", "请求麦克风权限");
+    }
+    // Immediate visual feedback – don't wait for getUserMedia
+    setUIState("listening");
+    log("requesting microphone…");
+    btnStart.disabled = true;
+    await startRecording();
+    if (!isRecording) {
+      // getUserMedia failed – revert
+      setUIState("idle");
+      btnStart.disabled = false;
+    }
+  });
+
+  btnStop.addEventListener("click", () => {
+    stopRecording();
+    stopPlaybackQueue();
+    ws?.send(JSON.stringify({ type: "playback.stop" }));
+    setUIState("idle");
+  });
+
+  btnReset.addEventListener("click", () => {
+    stopRecording();
+    stopPlaybackQueue();
+    hideLiveUser();
+    hideLiveAssistant();
+    chatHistory.innerHTML = "";
+    ws?.send(JSON.stringify({ type: "conversation.reset" }));
+    log("conversation reset");
+    setUIState("idle");
+    finalizeDebugTurn("reset", "conversation.reset");
+  });
+
+  btnDebug.addEventListener("click", () => {
+    setDebugEnabled(!debugEnabled);
+  });
+
+  btnDebugClear.addEventListener("click", () => {
+    resetDebugPanel();
+  });
+
+  debugTurnsEl.addEventListener("click", (event) => {
+    const item = event.target.closest("[data-debug-turn-id]");
+    if (!item) return;
+    selectedDebugTurnId = Number(item.dataset.debugTurnId);
+    renderDebugPanel();
+  });
+
+  // ──────────────────────────────────────────────────────────────
+  // Boot
+  // ──────────────────────────────────────────────────────────────
+  renderDebugPanel();
+  connectWS();
+</script>
+</body>

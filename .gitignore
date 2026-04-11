@@ -1,0 +1,31 @@
+.DS_Store
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.vscode/
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# Node
+**/node_modules/
+openclaw-extension-xtalk/dist/
+
+# Local runtime config and assets
+xtalk-bridge-service/.env
+xtalk-bridge-service/reference-audio/*
+!xtalk-bridge-service/reference-audio/.gitkeep
+
+# Heavy local dependencies and model assets
+xtalk-bridge-service/vendor/
+xtalk-bridge-service/pretrained_models/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
