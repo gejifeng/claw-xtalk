@@ -1,4 +1,4 @@
-# claw-xtalk
+# Claw-Xtalk
 
 OpenClaw x X-Talk alpha demo for full-duplex browser voice interaction.
 
