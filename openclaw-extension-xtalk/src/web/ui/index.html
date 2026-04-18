@@ -588,7 +588,16 @@
   // ──────────────────────────────────────────────────────────────
   // Config
   // ──────────────────────────────────────────────────────────────
-  const BRIDGE_WS   = `ws://${location.host}/ws`;
+  function resolveBridgeWsUrl() {
+    const url = new URL(window.location.href);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.pathname = url.pathname.replace(/\/ui\/?$/, "/ws");
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  }
+
+  const BRIDGE_WS   = resolveBridgeWsUrl();
   const SAMPLE_RATE = 16000;
   const CHUNK_MS    = 60;   // audio chunk cadence
   const LOCAL_SPEECH_RMS_THRESHOLD = 0.02;
