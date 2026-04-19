@@ -29,3 +29,6 @@ xtalk-bridge-service/pretrained_models/
 *.log
 *.tmp
 *.swp
+
+# data files
+*.wav
