@@ -321,6 +321,121 @@ class CosyVoiceTTS:
         return np.asarray(audio, dtype=np.float32).reshape(-1)
 
 
+class OmniVoiceTTS:
+    """High-performance local TTS backed by the OmniVoice diffusion-language model.
+
+    The model is loaded eagerly at construction time so that the first
+    ``synthesize()`` call incurs no model-loading overhead.  On a warm GPU with
+    ``num_step=8`` the time-to-first-audio is roughly 250 ms (RTF ≈ 0.05).
+
+    Voice modes (in priority order):
+      1. Voice cloning  – provide ``ref_audio`` + ``ref_text``.
+      2. Voice design   – provide ``instruct`` (e.g. ``"female, low pitch"``).
+      3. Auto voice     – leave everything empty; OmniVoice picks a voice.
+    """
+
+    mime_type = "audio/wav"
+    sample_rate = 24000
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        device: str = "cuda:0",
+        dtype: str = "float16",
+        num_step: int = 8,
+        guidance_scale: float = 2.0,
+        ref_audio: str | Path | None = None,
+        ref_text: str | None = None,
+        instruct: str | None = None,
+        speed: float = 1.0,
+    ):
+        self._ref_audio = str(ref_audio) if ref_audio else None
+        self._ref_text = ref_text or None
+        # instruct is only used when no ref_audio is given
+        self._instruct = (instruct or None) if not ref_audio else None
+        self._speed = speed
+        self._num_step = num_step
+
+        try:
+            import torch
+            from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+        except ImportError as exc:
+            raise TTSUnavailableError(
+                "omnivoice is not installed; run: pip install omnivoice"
+            ) from exc
+
+        _dtype = torch.float16 if dtype == "float16" else torch.float32
+        # Skip loading the built-in Whisper ASR when ref_text is already known,
+        # saving ~500 MB of VRAM and several seconds of startup time.
+        _load_asr = bool(self._ref_audio) and (self._ref_text is None)
+
+        model_key = str(model_path)
+        log.info(
+            "Loading OmniVoice model  path=%s  device=%s  dtype=%s  steps=%d  load_asr=%s",
+            model_key,
+            device,
+            dtype,
+            num_step,
+            _load_asr,
+        )
+        t0 = time.perf_counter()
+        self._model = OmniVoice.from_pretrained(
+            model_key,
+            device_map=device,
+            dtype=_dtype,
+            load_asr=_load_asr,
+        )
+        log.info("OmniVoice model ready in %.1f s", time.perf_counter() - t0)
+
+        # Pre-build generation config once; reused on every synthesize() call.
+        self._gen_config = OmniVoiceGenerationConfig(
+            num_step=num_step,
+            guidance_scale=guidance_scale,
+            denoise=True,
+            # position_temperature=5.0 preserves the natural rhythm of speech.
+            position_temperature=5.0,
+            # class_temperature=0.0 → greedy decoding: lowest latency, most stable.
+            class_temperature=0.0,
+            # Skip pre/post-processing hooks that are only needed for batch/demo use.
+            preprocess_prompt=False,
+            postprocess_output=False,
+        )
+
+    def synthesize(self, text: str) -> bytes:
+        normalized = text.strip()
+        if not normalized:
+            return b""
+
+        t0 = time.perf_counter()
+        try:
+            audio_list = self._model.generate(
+                text=normalized,
+                ref_audio=self._ref_audio,
+                ref_text=self._ref_text,
+                instruct=self._instruct,
+                speed=self._speed,
+                generation_config=self._gen_config,
+            )
+        except Exception as exc:
+            raise TTSUnavailableError(f"OmniVoice synthesis failed: {exc}") from exc
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        if not audio_list:
+            return b""
+
+        audio_np = np.asarray(audio_list[0], dtype=np.float32)
+        audio_duration_s = len(audio_np) / self.sample_rate
+        rtf = (elapsed_ms / 1000.0) / audio_duration_s if audio_duration_s > 0 else 0.0
+        log.info(
+            "[OmniVoice] chars=%d  ttfa=%.0f ms  dur=%.2f s  RTF=%.3f",
+            len(normalized),
+            elapsed_ms,
+            audio_duration_s,
+            rtf,
+        )
+        return _wav_bytes_from_float32(audio_np, self.sample_rate)
+
+
 class WhisperASREngine:
     def __init__(
         self,

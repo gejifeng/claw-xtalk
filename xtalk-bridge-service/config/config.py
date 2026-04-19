@@ -84,3 +84,27 @@ ALIYUN_COSYVOICE_SPEECH_RATE = float(os.getenv("ALIYUN_COSYVOICE_SPEECH_RATE", s
 ALIYUN_COSYVOICE_PITCH_RATE = float(os.getenv("ALIYUN_COSYVOICE_PITCH_RATE", "1.0"))
 ALIYUN_COSYVOICE_INSTRUCTION = os.getenv("ALIYUN_COSYVOICE_INSTRUCTION", "")
 ALIYUN_COSYVOICE_TIMEOUT_MS = int(os.getenv("ALIYUN_COSYVOICE_TIMEOUT_MS", "30000"))
+
+# ── OmniVoice TTS (local, high-performance) ───────────────────────────────────
+# Set TTS_PROVIDER=omnivoice to activate.
+# Model is downloaded automatically from HuggingFace on first run when the
+# local directory (OMNIVOICE_MODEL_DIR) does not yet exist.
+# For China: set HF_ENDPOINT=https://hf-mirror.com before starting the service.
+OMNIVOICE_MODEL = os.getenv("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
+OMNIVOICE_MODEL_DIR = Path(os.getenv("OMNIVOICE_MODEL_DIR", str(ROOT_DIR / "pretrained_models" / "OmniVoice")))
+# Compute device: cuda:0 (default), cpu, mps (Apple Silicon)
+OMNIVOICE_DEVICE = os.getenv("OMNIVOICE_DEVICE", "cuda:0")
+# dtype: float16 (recommended on CUDA), float32 (CPU/MPS fallback)
+OMNIVOICE_DTYPE = os.getenv("OMNIVOICE_DTYPE", "float16")
+# Diffusion steps — 8 is the sweet-spot for real-time (~250 ms TTFA on RTX 4060).
+# Raise to 16 for marginally better quality (~500 ms); avoid ≥32 in live conversations.
+OMNIVOICE_NUM_STEP = int(os.getenv("OMNIVOICE_NUM_STEP", "8"))
+OMNIVOICE_GUIDANCE_SCALE = float(os.getenv("OMNIVOICE_GUIDANCE_SCALE", "2.0"))
+OMNIVOICE_SPEED = float(os.getenv("OMNIVOICE_SPEED", "1.0"))
+# Voice-cloning: path to 3–10 s reference audio + its transcript.
+# Leave both empty to use OmniVoice's auto-voice mode.
+OMNIVOICE_REF_AUDIO = os.getenv("OMNIVOICE_REF_AUDIO", "")
+OMNIVOICE_REF_TEXT = os.getenv("OMNIVOICE_REF_TEXT", "")
+# Voice-design: comma-separated speaker attributes (e.g. "female, low pitch").
+# Mutually exclusive with REF_AUDIO; REF_AUDIO takes priority when both are set.
+OMNIVOICE_INSTRUCT = os.getenv("OMNIVOICE_INSTRUCT", "")

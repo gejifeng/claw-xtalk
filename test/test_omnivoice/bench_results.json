@@ -1,0 +1,126 @@
+{
+  "config": {
+    "model": "/home/gejifeng/DEV/LLM_DEV/claw-xtalk/xtalk-bridge-service/pretrained_models/OmniVoice",
+    "device": "cuda:0",
+    "steps": 16,
+    "ref_audio": null
+  },
+  "round_summaries": [
+    {
+      "round_id": 1,
+      "num_sentences": 5,
+      "total_text_chars": 133,
+      "total_audio_duration_s": 27.28,
+      "total_generation_time_s": 2.5207246399950236,
+      "avg_rtf": 0.09337053172291862,
+      "avg_ttfa_ms": 504.1449279990047,
+      "min_ttfa_ms": 444.50961699476466,
+      "max_ttfa_ms": 546.7659989953972,
+      "avg_gen_time_s": 0.5041449279990047,
+      "gap_before_round_s": 0.0
+    },
+    {
+      "round_id": 2,
+      "num_sentences": 3,
+      "total_text_chars": 86,
+      "total_audio_duration_s": 17.92,
+      "total_generation_time_s": 1.6458134689892177,
+      "avg_rtf": 0.09278943595907889,
+      "avg_ttfa_ms": 548.6044896630725,
+      "min_ttfa_ms": 508.64998798351735,
+      "max_ttfa_ms": 625.0908280198928,
+      "avg_gen_time_s": 0.5486044896630725,
+      "gap_before_round_s": 15.000109061977128
+    }
+  ],
+  "sentence_results": [
+    {
+      "round_id": 1,
+      "sentence_id": 1,
+      "text": "今天天气不错，阳光明媚，非常适合出门散步。",
+      "text_chars": 21,
+      "time_to_first_audio_ms": 444.50961699476466,
+      "audio_duration_s": 4.12,
+      "generation_time_s": 0.44450961699476466,
+      "rtf": 0.10789068373659336,
+      "sample_rate": 24000
+    },
+    {
+      "round_id": 1,
+      "sentence_id": 2,
+      "text": "人工智能技术近年来发展迅猛，已经深入到我们生活的方方面面。",
+      "text_chars": 29,
+      "time_to_first_audio_ms": 546.7659989953972,
+      "audio_duration_s": 6.0,
+      "generation_time_s": 0.5467659989953972,
+      "rtf": 0.09112766649923287,
+      "sample_rate": 24000
+    },
+    {
+      "round_id": 1,
+      "sentence_id": 3,
+      "text": "从智能手机的语音助手，到自动驾驶汽车，再到医疗诊断辅助系统。",
+      "text_chars": 30,
+      "time_to_first_audio_ms": 521.0788740077987,
+      "audio_duration_s": 6.04,
+      "generation_time_s": 0.5210788740077987,
+      "rtf": 0.08627133675625807,
+      "sample_rate": 24000
+    },
+    {
+      "round_id": 1,
+      "sentence_id": 4,
+      "text": "这些技术正在以前所未有的速度改变着人类社会的面貌。",
+      "text_chars": 25,
+      "time_to_first_audio_ms": 495.3705299994908,
+      "audio_duration_s": 5.32,
+      "generation_time_s": 0.4953705299994908,
+      "rtf": 0.09311476127809977,
+      "sample_rate": 24000
+    },
+    {
+      "round_id": 1,
+      "sentence_id": 5,
+      "text": "未来十年，我们可以期待更多令人惊叹的创新出现在各个领域。",
+      "text_chars": 28,
+      "time_to_first_audio_ms": 512.9996199975722,
+      "audio_duration_s": 5.8,
+      "generation_time_s": 0.5129996199975722,
+      "rtf": 0.088448210344409,
+      "sample_rate": 24000
+    },
+    {
+      "round_id": 2,
+      "sentence_id": 1,
+      "text": "语音合成技术的进步让人机交互变得更加自然流畅。",
+      "text_chars": 23,
+      "time_to_first_audio_ms": 508.64998798351735,
+      "audio_duration_s": 4.88,
+      "generation_time_s": 0.5086499879835173,
+      "rtf": 0.1042315549146552,
+      "sample_rate": 24000
+    },
+    {
+      "round_id": 2,
+      "sentence_id": 2,
+      "text": "实时语音对话系统对延迟有极高的要求，通常需要在三百毫秒以内完成响应。",
+      "text_chars": 34,
+      "time_to_first_audio_ms": 625.0908280198928,
+      "audio_duration_s": 7.04,
+      "generation_time_s": 0.6250908280198928,
+      "rtf": 0.08879131079828023,
+      "sample_rate": 24000
+    },
+    {
+      "round_id": 2,
+      "sentence_id": 3,
+      "text": "通过优化模型推理步数和批处理策略，可以显著降低端到端延迟。",
+      "text_chars": 29,
+      "time_to_first_audio_ms": 512.0726529858075,
+      "audio_duration_s": 6.0,
+      "generation_time_s": 0.5120726529858075,
+      "rtf": 0.08534544216430125,
+      "sample_rate": 24000
+    }
+  ]
+}

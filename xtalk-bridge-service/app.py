@@ -43,10 +43,21 @@ from config.config import (
     ALIYUN_COSYVOICE_PITCH_RATE,
     ALIYUN_COSYVOICE_INSTRUCTION,
     ALIYUN_COSYVOICE_TIMEOUT_MS,
+    OMNIVOICE_MODEL,
+    OMNIVOICE_MODEL_DIR,
+    OMNIVOICE_DEVICE,
+    OMNIVOICE_DTYPE,
+    OMNIVOICE_NUM_STEP,
+    OMNIVOICE_GUIDANCE_SCALE,
+    OMNIVOICE_SPEED,
+    OMNIVOICE_REF_AUDIO,
+    OMNIVOICE_REF_TEXT,
+    OMNIVOICE_INSTRUCT,
 )
 from xtalk_runtime import (
     CosyVoiceTTS,
     DashScopeCosyVoiceTTS,
+    OmniVoiceTTS,
     QwenRealtimeASREngine,
     StubTTS,
     WhisperASREngine,
@@ -120,6 +131,27 @@ def _build_tts_engine():
             pitch_rate=ALIYUN_COSYVOICE_PITCH_RATE,
             instruction=ALIYUN_COSYVOICE_INSTRUCTION or None,
             timeout_millis=ALIYUN_COSYVOICE_TIMEOUT_MS,
+        )
+    if TTS_PROVIDER == "omnivoice":
+        # Resolve model source: prefer the local directory; fall back to HF download.
+        model_source = str(OMNIVOICE_MODEL_DIR) if OMNIVOICE_MODEL_DIR.exists() else OMNIVOICE_MODEL
+        log.info(
+            "Configuring OmniVoice TTS  source=%s  device=%s  dtype=%s  steps=%d",
+            model_source,
+            OMNIVOICE_DEVICE,
+            OMNIVOICE_DTYPE,
+            OMNIVOICE_NUM_STEP,
+        )
+        return OmniVoiceTTS(
+            model_path=model_source,
+            device=OMNIVOICE_DEVICE,
+            dtype=OMNIVOICE_DTYPE,
+            num_step=OMNIVOICE_NUM_STEP,
+            guidance_scale=OMNIVOICE_GUIDANCE_SCALE,
+            ref_audio=OMNIVOICE_REF_AUDIO or None,
+            ref_text=OMNIVOICE_REF_TEXT or None,
+            instruct=OMNIVOICE_INSTRUCT or None,
+            speed=OMNIVOICE_SPEED,
         )
     if TTS_PROVIDER != "cosyvoice":
         log.warning("Unsupported TTS provider %s; using stub engine", TTS_PROVIDER)

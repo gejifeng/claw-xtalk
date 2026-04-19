@@ -11,6 +11,12 @@ from xtalk_runtime import TTSUnavailableError
 
 log = logging.getLogger(__name__)
 
+# Maximum number of TTS synthesis tasks that may run concurrently.
+# With a local GPU model the underlying CUDA stream serialises all kernel
+# launches anyway, so a value of 2 already eliminates the Python-level
+# dead-time between consecutive sentences without overloading the device.
+TTS_MAX_CONCURRENT_SYNTH = 2
+
 
 class _SessionState:
     def __init__(self, session_id: str, asr_engine, tts, send_json):
@@ -20,9 +26,9 @@ class _SessionState:
         self.asr_stream = None
         self.tts = tts
         self._send_json = send_json
-        self.tts_queue: asyncio.Queue[tuple[str, str, int]] = asyncio.Queue()
+        # text=None is the flush sentinel that marks end-of-stream.
+        self.tts_queue: asyncio.Queue[tuple[str, str | None, int]] = asyncio.Queue()
         self.tts_generation = 0
-        self.flush_requested = False
         self.playback_active = False
         self.tts_seq = 0
         self.tts_worker: asyncio.Task | None = None
@@ -127,11 +133,12 @@ class _SessionState:
         self.tts_queue.put_nowait((turn_id, text, self.tts_generation))
 
     def request_flush(self) -> None:
-        self.flush_requested = True
+        # Put a sentinel (text=None) so the dispatch loop knows the stream is
+        # complete and can emit playback.finished after all audio is sent.
+        self.tts_queue.put_nowait((self.turn_id or "", None, self.tts_generation))
 
     def reset_tts(self) -> None:
         self.tts_generation += 1
-        self.flush_requested = False
         self.playback_active = False
         self.tts_seq = 0
         while True:
@@ -273,65 +280,165 @@ class BridgeWebSocketServer:
         sess.tts_worker = asyncio.create_task(self._run_tts_worker(ws, sess))
 
     async def _run_tts_worker(self, ws: WebSocketServerProtocol, sess: _SessionState) -> None:
-        try:
+        """
+        Pipelined TTS worker with parallel synthesis and in-order delivery.
+
+        Architecture
+        ────────────
+        _dispatch (async task)
+          • Pulls (turn_id, text, gen) tuples from sess.tts_queue.
+          • Assigns monotonically-increasing sequence numbers.
+          • Acquires a semaphore slot and spawns a _synth task for each chunk.
+          • When the flush sentinel (text=None) is seen, it returns the total
+            chunk count and exits.
+
+        _synth (async tasks, up to TTS_MAX_CONCURRENT_SYNTH in parallel)
+          • Calls sess.tts.synthesize(text) on a thread-pool thread.
+          • Deposits the result (bytes, keyed by sequence number) into `pending`.
+          • Releases its semaphore slot and fires the `ready` event.
+
+        _send_in_order (inline, same coroutine)
+          • Waits for each sequence number 0, 1, 2, … to appear in `pending`.
+          • Sends tts.audio frames to the client in strict order.
+          • After all chunks are delivered, sends playback.finished.
+
+        The decoupling between synthesis and delivery means chunk N+1 can start
+        synthesising as soon as a semaphore slot is free — even if chunk N is
+        still being sent — while the client always receives audio in order.
+        """
+        generation = sess.tts_generation
+        sem = asyncio.Semaphore(TTS_MAX_CONCURRENT_SYNTH)
+        pending: dict[int, bytes] = {}   # seq → synthesised audio (b"" = skip)
+        ready = asyncio.Event()          # fired whenever pending gains a new entry
+
+        # ── Synthesis task ────────────────────────────────────────────────────
+        async def _synth(seq: int, turn_id: str, text: str) -> None:
+            try:
+                if sess.tts_generation != generation or sess.turn_id != turn_id:
+                    pending[seq] = b""
+                    return
+                audio = await asyncio.to_thread(sess.tts.synthesize, text)
+                if sess.tts_generation != generation or sess.turn_id != turn_id:
+                    audio = b""
+                pending[seq] = audio
+            except TTSUnavailableError as exc:
+                log.warning("[TTS] unavailable seq=%d session=%s: %s", seq, sess.session_id, exc)
+                pending[seq] = b""
+            except Exception:
+                log.exception("[TTS] synthesis error seq=%d session=%s", seq, sess.session_id)
+                pending[seq] = b""
+            finally:
+                sem.release()
+                ready.set()
+
+        # ── Dispatch loop (runs as a separate task) ────────────────────────────
+        async def _dispatch() -> int:
+            """Consume the queue and spawn synthesis tasks.
+            Returns the total number of chunks dispatched (excluding sentinel)."""
+            seq = 0
+            try:
+                while True:
+                    turn_id, text, gen = await sess.tts_queue.get()
+                    try:
+                        if gen != generation:
+                            continue
+                        if text is None:          # flush sentinel
+                            ready.set()           # wake sender in case it's waiting
+                            return seq
+                        await sem.acquire()       # throttle concurrency
+                        asyncio.create_task(_synth(seq, turn_id, text))
+                        seq += 1
+                    finally:
+                        sess.tts_queue.task_done()
+            except asyncio.CancelledError:
+                ready.set()
+                raise
+
+        dispatch_task = asyncio.create_task(_dispatch())
+
+        # ── Sender (runs in this coroutine, interleaved via await) ─────────────
+        async def _send_in_order() -> None:
+            send_seq = 0
+            total: int | None = None
+
             while True:
-                turn_id, text, generation = await sess.tts_queue.get()
-                try:
-                    if generation != sess.tts_generation or turn_id != sess.turn_id:
-                        continue
-                    audio_bytes = await asyncio.to_thread(sess.tts.synthesize, text)
-                    if generation != sess.tts_generation or turn_id != sess.turn_id:
-                        continue
-                    if audio_bytes:
-                        if not sess.playback_active:
-                            sess.playback_active = True
-                            await self._send(
-                                ws,
-                                {
-                                    "type": "playback.started",
-                                    "sessionId": sess.session_id,
-                                    "turnId": turn_id,
-                                },
-                            )
-                        sess.tts_seq += 1
-                        await self._send(
-                            ws,
-                            {
-                                "type": "tts.audio",
-                                "sessionId": sess.session_id,
-                                "turnId": turn_id,
-                                "audioBase64": base64.b64encode(audio_bytes).decode("ascii"),
-                                "mimeType": getattr(sess.tts, "mime_type", "audio/wav"),
-                                "sampleRate": getattr(sess.tts, "sample_rate", 24000),
-                                "seq": sess.tts_seq,
-                            },
-                        )
-                    if sess.tts_queue.empty() and sess.flush_requested and generation == sess.tts_generation:
-                        if sess.playback_active:
-                            await self._send(
-                                ws,
-                                {
-                                    "type": "playback.finished",
-                                    "sessionId": sess.session_id,
-                                    "turnId": turn_id,
-                                },
-                            )
-                            sess.playback_active = False
-                        sess.flush_requested = False
-                except TTSUnavailableError as exc:
-                    log.warning("TTS unavailable for session=%s turn=%s: %s", sess.session_id, turn_id, exc)
-                    sess.flush_requested = False
-                    sess.playback_active = False
-                    await self._send(ws, {"type": "error", "turnId": turn_id, "message": str(exc)})
-                except Exception as exc:  # pragma: no cover - runtime dependent
-                    log.exception("TTS synthesis failed session=%s turn=%s", sess.session_id, turn_id)
-                    sess.flush_requested = False
-                    sess.playback_active = False
-                    await self._send(ws, {"type": "error", "turnId": turn_id, "message": f"TTS failed: {exc}"})
-                finally:
-                    sess.tts_queue.task_done()
+                # Refresh total once dispatch has finished
+                if total is None and dispatch_task.done():
+                    try:
+                        total = dispatch_task.result()
+                    except Exception:
+                        return
+
+                # Exit when all chunks have been delivered
+                if total is not None and send_seq >= total:
+                    break
+
+                # Wait until the next chunk is ready (race-safe check-clear-check)
+                while send_seq not in pending:
+                    ready.clear()
+                    if send_seq in pending:        # re-check after clear
+                        break
+                    if sess.tts_generation != generation:
+                        return
+                    # Also re-check total so we don't hang after a 0-chunk flush
+                    if total is None and dispatch_task.done():
+                        try:
+                            total = dispatch_task.result()
+                        except Exception:
+                            return
+                        if total is not None and send_seq >= total:
+                            return
+                    await ready.wait()
+                    if sess.tts_generation != generation:
+                        return
+
+                if sess.tts_generation != generation:
+                    return
+
+                audio = pending.pop(send_seq)
+                turn_id = sess.turn_id or ""
+
+                if audio:
+                    if not sess.playback_active:
+                        sess.playback_active = True
+                        await self._send(ws, {
+                            "type": "playback.started",
+                            "sessionId": sess.session_id,
+                            "turnId": turn_id,
+                        })
+                    sess.tts_seq += 1
+                    await self._send(ws, {
+                        "type": "tts.audio",
+                        "sessionId": sess.session_id,
+                        "turnId": turn_id,
+                        "audioBase64": base64.b64encode(audio).decode("ascii"),
+                        "mimeType": getattr(sess.tts, "mime_type", "audio/wav"),
+                        "sampleRate": getattr(sess.tts, "sample_rate", 24000),
+                        "seq": sess.tts_seq,
+                    })
+
+                send_seq += 1
+
+            # All chunks delivered → notify client
+            if sess.tts_generation == generation and sess.playback_active:
+                await self._send(ws, {
+                    "type": "playback.finished",
+                    "sessionId": sess.session_id,
+                    "turnId": sess.turn_id or "",
+                })
+                sess.playback_active = False
+
+        try:
+            await _send_in_order()
         except asyncio.CancelledError:
             pass
+        finally:
+            if not dispatch_task.done():
+                dispatch_task.cancel()
+                try:
+                    await dispatch_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     @staticmethod
     async def _send(ws: WebSocketServerProtocol, payload: dict):

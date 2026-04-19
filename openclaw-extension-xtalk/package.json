@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc && rm -rf dist/web/ui && cp -r src/web/ui dist/web/",
     "dev": "tsc --watch",
+    "prestart": "npm run build",
     "start": "node dist/index.js"
   },
   "dependencies": {

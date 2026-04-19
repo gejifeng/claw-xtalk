@@ -120,6 +120,7 @@ Supported provider modes:
 - `ASR_PROVIDER=whisper` for local fallback ASR
 - `TTS_PROVIDER=aliyun-cosyvoice` for DashScope CosyVoice
 - `TTS_PROVIDER=cosyvoice` for local CosyVoice fallback
+- `TTS_PROVIDER=omnivoice` for local OmniVoice (high-performance diffusion model, no API key needed)
 
 ## Runtime Requirements
 
@@ -190,6 +191,12 @@ For the current demo, the most reliable cloud smoke-test combination is:
 - `TTS_PROVIDER=aliyun-cosyvoice`
 - `ALIYUN_COSYVOICE_MODEL=cosyvoice-v3-flash`
 - `ALIYUN_COSYVOICE_VOICE=longanyang`
+
+For a fully local, no-API-key setup using OmniVoice TTS:
+
+- `ASR_PROVIDER=whisper`
+- `TTS_PROVIDER=omnivoice`
+- `OMNIVOICE_DEVICE=cuda:0`
 
 Note:
 
@@ -292,6 +299,108 @@ Notes:
 - local CosyVoice is heavier and more environment-sensitive than the cloud path
 - cloud mode is the recommended default for demo and GitHub onboarding
 
+## Optional Local OmniVoice Mode
+
+OmniVoice is a locally-running diffusion-language TTS model with no cloud dependency.
+It delivers competitive latency on a consumer GPU (RTX 3060 or better) and supports
+voice cloning, voice design, and auto-voice modes.
+
+### Hardware requirements
+
+| Component | Minimum | Recommended |
+| --- | --- | --- |
+| GPU VRAM | 6 GB (with `float16`) | 8+ GB |
+| GPU | RTX 2080 / A10 | RTX 3090 / 4090 |
+| CUDA | 11.8+ | 12.x |
+| Python | 3.10 | 3.10–3.12 |
+
+CPU-only mode works but is much slower and not suitable for real-time conversation.
+
+### Install the Python package
+
+```bash
+pip install omnivoice
+```
+
+### First-run model download
+
+On the first start the sidecar will download the model weights (~3 GB) from
+HuggingFace automatically when `OMNIVOICE_MODEL_DIR` does not yet exist.
+
+China users: set the HuggingFace mirror before starting:
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+Or pre-download manually and point `OMNIVOICE_MODEL_DIR` at the local copy:
+
+```bash
+huggingface-cli download k2-fsa/OmniVoice --local-dir ./pretrained_models/OmniVoice
+```
+
+### Activate in `.env`
+
+```text
+TTS_PROVIDER=omnivoice
+OMNIVOICE_DEVICE=cuda:0
+OMNIVOICE_DTYPE=float16
+OMNIVOICE_NUM_STEP=8
+```
+
+### Voice modes
+
+**Auto voice** (simplest — no extra config needed):
+
+```text
+# leave REF_AUDIO, REF_TEXT, OMNIVOICE_INSTRUCT all empty
+```
+
+**Voice design** (no reference recording required):
+
+```text
+OMNIVOICE_INSTRUCT=female, low pitch
+```
+
+Other example values: `"male, energetic, fast"`, `"warm, elderly female"`.
+
+**Voice cloning** (best quality, requires a 3–10 second reference clip):
+
+```text
+OMNIVOICE_REF_AUDIO=./reference-audio/my_voice.wav
+OMNIVOICE_REF_TEXT=这是我用来克隆声音的参考句子。
+```
+
+Setting `OMNIVOICE_REF_TEXT` lets OmniVoice skip its built-in Whisper ASR transcription,
+saving approximately 500 MB of VRAM and several seconds of startup time.
+
+### Latency benchmark (warm GPU, `NUM_STEP=8`)
+
+The following log was captured on a typical run with the default pipeline settings:
+
+```text
+[OmniVoice] chars=26  ttfa=1180 ms  dur=6.20 s  RTF=0.190
+[OmniVoice] chars=32  ttfa=1448 ms  dur=12.96 s  RTF=0.112
+[OmniVoice] chars=14  ttfa=1095 ms  dur=5.08 s  RTF=0.216
+[OmniVoice] chars=10  ttfa=1036 ms  dur=2.88 s  RTF=0.360
+[OmniVoice] chars=6   ttfa=970 ms   dur=2.08 s  RTF=0.466
+```
+
+`ttfa` is time-to-first-audio (synthesis latency). `RTF` below 1.0 means the audio is
+generated faster than real time. The parallel synthesis pipeline introduced in this
+project means the next sentence starts generating while the current one is still playing,
+so the effective user-perceived gap between sentences approaches zero.
+
+### Tuning tips
+
+- **Latency vs quality**: `OMNIVOICE_NUM_STEP=8` is the recommended sweet-spot.
+  Raising to 16 gives marginally better prosody at roughly 2× synthesis time.
+  Do not exceed 32 in live conversation; the quality improvement is negligible.
+- **Speed**: `OMNIVOICE_SPEED=1.1` to `1.2` can reduce overall response duration
+  without sounding unnatural.
+- **Guidance scale**: keep `OMNIVOICE_GUIDANCE_SCALE` at `2.0`; higher values can
+  introduce artefacts on short utterances.
+
 ## Configuration Reference
 
 ### Bridge process
@@ -320,11 +429,21 @@ Important variables:
 | `QWEN_ASR_SAMPLE_RATE` | Usually `16000` |
 | `QWEN_ASR_TURN_DETECTION_THRESHOLD` | Server-side VAD sensitivity |
 | `QWEN_ASR_TURN_DETECTION_SILENCE_MS` | Server-side endpoint silence window |
-| `TTS_PROVIDER` | `aliyun-cosyvoice` or `cosyvoice` |
+| `TTS_PROVIDER` | `aliyun-cosyvoice`, `cosyvoice`, or `omnivoice` |
 | `ALIYUN_COSYVOICE_MODEL` | Cloud TTS model |
 | `ALIYUN_COSYVOICE_VOICE` | Voice ID or system voice depending on model |
 | `ALIYUN_COSYVOICE_AUDIO_FORMAT` | Output format, recommended WAV-compatible PCM |
 | `ALIYUN_COSYVOICE_TIMEOUT_MS` | Timeout per TTS request |
+| `OMNIVOICE_MODEL` | HuggingFace model ID (default `k2-fsa/OmniVoice`) |
+| `OMNIVOICE_MODEL_DIR` | Local path; if it exists, loads from disk without network access |
+| `OMNIVOICE_DEVICE` | `cuda:0` (default), `cpu`, or `mps` |
+| `OMNIVOICE_DTYPE` | `float16` (CUDA) or `float32` (CPU/MPS) |
+| `OMNIVOICE_NUM_STEP` | Diffusion steps — `8` for real-time, `16` for higher quality |
+| `OMNIVOICE_GUIDANCE_SCALE` | CFG scale, `2.0` recommended |
+| `OMNIVOICE_SPEED` | Speaking speed multiplier, `1.0` = natural |
+| `OMNIVOICE_REF_AUDIO` | Path to 3–10 s reference WAV for voice cloning |
+| `OMNIVOICE_REF_TEXT` | Transcript of `OMNIVOICE_REF_AUDIO` (skips built-in ASR) |
+| `OMNIVOICE_INSTRUCT` | Voice-design attribute string, e.g. `"female, low pitch"` |
 
 ## Turn Flow
 
