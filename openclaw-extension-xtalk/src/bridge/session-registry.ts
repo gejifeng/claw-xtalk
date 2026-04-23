@@ -52,6 +52,7 @@ export class SessionRegistry {
       agentRunId: null,
       assistantText: "",
       pendingTTSBuffer: "",
+      firstChunkSent: false,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };

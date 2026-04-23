@@ -25,6 +25,9 @@ function isIgnorableUtterance(text: string): boolean {
 }
 
 export class TurnOrchestrator extends EventEmitter {
+  // Tracks the active 150 ms forced-flush timer per browser session.
+  private readonly _firstChunkTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
   constructor(
     private readonly registry: SessionRegistry,
     private readonly xtalk: XtalkAdapter,
@@ -90,18 +93,49 @@ export class TurnOrchestrator extends EventEmitter {
   private onAgentDelta(browserSessionId: string, turnId: string, delta: string): void {
     const mapping = this.registry.get(browserSessionId);
     if (!mapping?.currentTurn || mapping.currentTurn.turnId !== turnId) return;
-    if (mapping.currentTurn.state === "Thinking") {
+
+    const isFirstDelta = mapping.currentTurn.state === "Thinking";
+    if (isFirstDelta) {
       console.log(`[TurnOrchestrator] first delta received bid=${browserSessionId}`);
       this.registry.setTurnState(browserSessionId, "Speaking");
+      // Start a 150 ms deadline: if no sentence boundary arrives in time, force
+      // dispatch whatever is buffered so TTS can start without waiting for
+      // punctuation.  The timer is cancelled the moment the first chunk is sent.
+      const timer = setTimeout(() => {
+        this._firstChunkTimers.delete(browserSessionId);
+        const m = this.registry.get(browserSessionId);
+        if (!m?.currentTurn || m.currentTurn.turnId !== turnId) return;
+        if (m.currentTurn.firstChunkSent) return;
+        const buffered = m.currentTurn.pendingTTSBuffer;
+        if (buffered.trim().length === 0) return;
+        m.currentTurn.pendingTTSBuffer = "";
+        m.currentTurn.firstChunkSent = true;
+        console.log(`[TurnOrchestrator] 150ms deadline flush bid=${browserSessionId} chars=${buffered.length}`);
+        this.xtalk.ttsSendChunk(m.xtalkSessionId, turnId, buffered);
+      }, 150);
+      this._firstChunkTimers.set(browserSessionId, timer);
     }
     this.emit("event", { kind: "AGENT_DELTA", browserSessionId, turnId, text: delta });
 
     mapping.currentTurn.assistantText += delta;
     mapping.currentTurn.pendingTTSBuffer += delta;
-    const chunks = this.chunking.extractReady(mapping.currentTurn.pendingTTSBuffer);
+
+    // skipMinLen=true until the first chunk has been sent so that a short
+    // opening clause is dispatched immediately on the first sentence boundary.
+    const skipMinLen = !mapping.currentTurn.firstChunkSent;
+    const chunks = this.chunking.extractReady(mapping.currentTurn.pendingTTSBuffer, skipMinLen);
     if (chunks.ready.length > 0) {
       mapping.currentTurn.pendingTTSBuffer = chunks.remaining;
       for (const chunk of chunks.ready) {
+        if (!mapping.currentTurn.firstChunkSent) {
+          mapping.currentTurn.firstChunkSent = true;
+          // Cancel the deadline timer – a boundary was found in time.
+          const timer = this._firstChunkTimers.get(browserSessionId);
+          if (timer !== undefined) {
+            clearTimeout(timer);
+            this._firstChunkTimers.delete(browserSessionId);
+          }
+        }
         this.xtalk.ttsSendChunk(mapping.xtalkSessionId, turnId, chunk);
       }
     }
@@ -140,6 +174,13 @@ export class TurnOrchestrator extends EventEmitter {
     if (!mapping?.currentTurn) return;
     const { turnId } = mapping.currentTurn;
     const { xtalkSessionId } = mapping;
+
+    // Cancel any pending first-chunk deadline timer before the turn is replaced.
+    const pendingTimer = this._firstChunkTimers.get(browserSessionId);
+    if (pendingTimer !== undefined) {
+      clearTimeout(pendingTimer);
+      this._firstChunkTimers.delete(browserSessionId);
+    }
 
     this.registry.setTurnState(browserSessionId, "Interrupted");
     this.xtalk.stopPlayback(xtalkSessionId, turnId);

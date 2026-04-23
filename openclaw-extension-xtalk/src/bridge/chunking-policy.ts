@@ -15,10 +15,18 @@ export class ChunkingPolicy {
   /**
    * Given the accumulated pending buffer, extract zero or more ready-to-send
    * chunks and return the leftover tail.
+   *
+   * @param skipMinLen - When true the first extracted chunk bypasses the
+   *   MIN_CHUNK_LEN merge heuristic and is emitted on the very first sentence
+   *   boundary.  Pass this flag for the first TTS chunk of a turn so that a
+   *   short opening clause (e.g. "好的！") is dispatched immediately rather
+   *   than being merged with the following sentence, which would stall TTS by
+   *   one extra LLM generation cycle.
    */
-  extractReady(buffer: string): ChunkResult {
+  extractReady(buffer: string, skipMinLen = false): ChunkResult {
     const ready: string[] = [];
     let remaining = buffer;
+    let isFirst = true;
 
     while (remaining.length > 0) {
       if (remaining.length >= MAX_CHUNK_LEN) {
@@ -27,6 +35,7 @@ export class ChunkingPolicy {
         const splitAt = boundaryIdx !== -1 ? boundaryIdx + 1 : MAX_CHUNK_LEN;
         ready.push(remaining.slice(0, splitAt));
         remaining = remaining.slice(splitAt);
+        isFirst = false;
         continue;
       }
 
@@ -34,15 +43,17 @@ export class ChunkingPolicy {
       if (boundaryIdx === -1) break;
 
       const candidate = remaining.slice(0, boundaryIdx + 1);
-      if (candidate.length >= MIN_CHUNK_LEN) {
+      if (candidate.length >= MIN_CHUNK_LEN || (skipMinLen && isFirst)) {
         ready.push(candidate);
         remaining = remaining.slice(boundaryIdx + 1);
+        isFirst = false;
       } else {
         const nextBoundary = this.firstBoundary(remaining.slice(boundaryIdx + 1));
         if (nextBoundary === -1) break;
         const merged = remaining.slice(0, boundaryIdx + 1 + nextBoundary + 1);
         ready.push(merged);
         remaining = remaining.slice(merged.length);
+        isFirst = false;
       }
     }
 

@@ -20,6 +20,8 @@ export interface TurnContext {
   assistantText: string;
   /** Accumulates assistant text waiting to be chunked and sent to TTS */
   pendingTTSBuffer: string;
+  /** True once the first TTS chunk has been dispatched for this turn */
+  firstChunkSent: boolean;
   createdAt: number;
   updatedAt: number;
 }

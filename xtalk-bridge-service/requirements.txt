@@ -6,4 +6,4 @@ dashscope>=1.25.6
 # OmniVoice local TTS (only required when TTS_PROVIDER=omnivoice)
 # Install PyTorch for your CUDA version first: https://pytorch.org/get-started/locally/
 # then: pip install omnivoice
-# omnivoice>=0.1.4
+omnivoice>=0.1.4

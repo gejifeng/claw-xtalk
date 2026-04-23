@@ -401,6 +401,33 @@ class OmniVoiceTTS:
             postprocess_output=False,
         )
 
+        # Pre-compute the voice-clone prompt once at startup so that every
+        # synthesize() call can pass a pre-built prompt object instead of
+        # re-encoding the reference audio on every request (~10–30 ms saved).
+        # Falls back to None when running in voice-design or auto-voice mode.
+        self._voice_clone_prompt = None
+        if self._ref_audio:
+            ref_path = Path(self._ref_audio)
+            if ref_path.exists():
+                try:
+                    t1 = time.perf_counter()
+                    self._voice_clone_prompt = self._model.create_voice_clone_prompt(
+                        ref_audio=self._ref_audio,
+                        ref_text=self._ref_text,
+                    )
+                    log.info(
+                        "OmniVoice voice-clone prompt built in %.2f s",
+                        time.perf_counter() - t1,
+                    )
+                except Exception:
+                    log.warning(
+                        "OmniVoice create_voice_clone_prompt failed; "
+                        "will pass ref_audio path on every call instead",
+                        exc_info=True,
+                    )
+            else:
+                log.warning("OmniVoice ref_audio not found at %s; voice cloning disabled", self._ref_audio)
+
     def synthesize(self, text: str) -> bytes:
         normalized = text.strip()
         if not normalized:
@@ -408,14 +435,23 @@ class OmniVoiceTTS:
 
         t0 = time.perf_counter()
         try:
-            audio_list = self._model.generate(
-                text=normalized,
-                ref_audio=self._ref_audio,
-                ref_text=self._ref_text,
-                instruct=self._instruct,
-                speed=self._speed,
-                generation_config=self._gen_config,
-            )
+            if self._voice_clone_prompt is not None:
+                # Fast path: pre-built prompt object, no per-call ref-audio encoding.
+                audio_list = self._model.generate(
+                    text=normalized,
+                    voice_clone_prompt=self._voice_clone_prompt,
+                    speed=self._speed,
+                    generation_config=self._gen_config,
+                )
+            else:
+                audio_list = self._model.generate(
+                    text=normalized,
+                    ref_audio=self._ref_audio,
+                    ref_text=self._ref_text,
+                    instruct=self._instruct,
+                    speed=self._speed,
+                    generation_config=self._gen_config,
+                )
         except Exception as exc:
             raise TTSUnavailableError(f"OmniVoice synthesis failed: {exc}") from exc
 
