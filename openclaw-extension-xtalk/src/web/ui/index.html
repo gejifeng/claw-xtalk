@@ -605,11 +605,22 @@
   const LOCAL_SPEECH_NOISE_MARGIN = 0.004;
   const LOCAL_SPEECH_START_CHUNKS = 2;
   const LOCAL_SPEECH_END_SILENCE_CHUNKS = 8;
-  const LOCAL_BARGE_IN_RMS_THRESHOLD = 0.03;
-  const LOCAL_BARGE_IN_NOISE_MULTIPLIER = 3.2;
-  const LOCAL_BARGE_IN_NOISE_MARGIN = 0.008;
-  const LOCAL_BARGE_IN_CONSECUTIVE_CHUNKS = 4;
-  const LOCAL_BARGE_IN_PLAYBACK_GRACE_MS = 900;
+  // ── Barge-in (打断 AI 说话) 触发条件 ────────────────────────
+  // 这些参数在播放 AI 音频期间使用，用于判断"用户开口插话"。
+  // 由于现代浏览器 AEC/NS 对扬声器漏音抑制有限、且环境杂音难以避免，
+  // 这里用相当保守的多重门槛：RMS + 绝对峰值 + 连续块 + 宽限期。
+  // 任何一项不满足都不会触发 barge-in。
+  const LOCAL_BARGE_IN_RMS_THRESHOLD = 0.07;          // 之前 0.03,过松
+  const LOCAL_BARGE_IN_PEAK_THRESHOLD = 0.22;          // 新增:绝对峰值门槛,
+                                                       // 过滤短促冲击噪声/喇叭漏音
+  const LOCAL_BARGE_IN_NOISE_MULTIPLIER = 5.0;         // 之前 3.2
+  const LOCAL_BARGE_IN_NOISE_MARGIN = 0.015;           // 之前 0.008
+  const LOCAL_BARGE_IN_CONSECUTIVE_CHUNKS = 8;         // 之前 4 (~240ms),
+                                                       // 现在 ~480ms 持续语音
+  const LOCAL_BARGE_IN_PENALTY_DECAY = 2;              // 安静块对计数器的惩罚
+                                                       // 倍率,要求"真正持续"
+  const LOCAL_BARGE_IN_PLAYBACK_GRACE_MS = 1500;       // 之前 900ms,
+                                                       // AI 起播后的免打断窗口
   const LOCAL_NOISE_FLOOR_EMA = 0.08;
   const MIC_PREROLL_CHUNKS = 6;
   const DEBUG_STORAGE_KEY = "xtalk-debug-enabled";
@@ -956,6 +967,16 @@
     return Math.sqrt(sum / float32.length);
   }
 
+  function computePeak(float32) {
+    if (!float32 || float32.length === 0) return 0;
+    let peak = 0;
+    for (let i = 0; i < float32.length; i++) {
+      const a = Math.abs(float32[i]);
+      if (a > peak) peak = a;
+    }
+    return peak;
+  }
+
   function hasPendingPlayback() {
     return playbackIsActive || playbackQueue.length > 0 || playbackDecodeInFlight > 0 || playbackPendingSourceCount > 0;
   }
@@ -1075,7 +1096,7 @@
     }
   }
 
-  function maybeInterruptForLocalSpeech(rms) {
+  function maybeInterruptForLocalSpeech(rms, peak) {
     if (!isRecording) return;
     if (playbackInterruptSent) return;
     if (!hasPendingPlayback()) return;
@@ -1083,18 +1104,26 @@
 
     const bargeInThreshold = getBargeInThreshold();
 
-    if (rms >= bargeInThreshold) {
+    // Multi-gate: 必须同时满足 RMS 阈值 *和* 绝对峰值阈值。
+    // 这能过滤掉两类常见误触:
+    //   1) 持续低幅环境噪声(空调/风扇) - RMS 高但 peak 不够
+    //   2) 短促冲击噪声(键盘/桌面敲击) - 持续不够,且只在峰值瞬间过线
+    const energyOk = rms >= bargeInThreshold;
+    const peakOk = peak >= LOCAL_BARGE_IN_PEAK_THRESHOLD;
+
+    if (energyOk && peakOk) {
       localSpeechChunkCount += 1;
     } else {
-      localSpeechChunkCount = 0;
+      // 安静块带惩罚衰减,要求"真正持续"的语音,而不是间歇杂音。
+      localSpeechChunkCount = Math.max(0, localSpeechChunkCount - LOCAL_BARGE_IN_PENALTY_DECAY);
       return;
     }
 
     if (localSpeechChunkCount < LOCAL_BARGE_IN_CONSECUTIVE_CHUNKS) return;
     playbackInterruptSent = true;
     localSpeechChunkCount = 0;
-    log(`local barge-in detected rms=${rms.toFixed(3)} threshold=${bargeInThreshold.toFixed(3)} noise=${localNoiseFloorRms.toFixed(3)}`);
-    pushDebugEvent("interrupt.local", `浏览器本地检测到插话 rms=${rms.toFixed(3)} threshold=${bargeInThreshold.toFixed(3)} noise=${localNoiseFloorRms.toFixed(3)}`);
+    log(`local barge-in detected rms=${rms.toFixed(3)} peak=${peak.toFixed(3)} threshold=${bargeInThreshold.toFixed(3)} noise=${localNoiseFloorRms.toFixed(3)}`);
+    pushDebugEvent("interrupt.local", `浏览器本地检测到插话 rms=${rms.toFixed(3)} peak=${peak.toFixed(3)} threshold=${bargeInThreshold.toFixed(3)} noise=${localNoiseFloorRms.toFixed(3)}`);
     stopPlaybackQueue({ preserveMicPreroll: true, preserveInterruptFlag: true });
     ws?.send(JSON.stringify({ type: "playback.stop" }));
     setUIState("interrupted");
@@ -1493,18 +1522,47 @@
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
     try {
+      // 标准约束(所有现代浏览器都识别)。把非标准 goog*/voiceIsolation 放进
+      // advanced —— 浏览器不识别时按规范应静默忽略整个 advanced 项,
+      // 不会让 getUserMedia 整体失败。
+      const audioConstraints = {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        advanced: [
+          { googEchoCancellation: true },
+          { googEchoCancellation2: true },
+          { googNoiseSuppression: true },
+          { googNoiseSuppression2: true },
+          { googAutoGainControl: true },
+          { googHighpassFilter: true },
+          { googTypingNoiseDetection: true },
+          { voiceIsolation: true },
+        ],
+      };
       mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
+        audio: audioConstraints,
         video: false,
       });
     } catch (err) {
       log(describeMicError(err));
-      return;
+      // 兜底:若包含 advanced 时被某些浏览器拒绝,退回最简标准约束再试一次。
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: false,
+        });
+        log("mic fallback (basic constraints) ok");
+      } catch (err2) {
+        log(describeMicError(err2));
+        return;
+      }
     }
 
     try {
@@ -1531,12 +1589,13 @@
         if (!isRecording || ws?.readyState !== WebSocket.OPEN) return;
         const f32 = ev.inputBuffer.getChannelData(0);
         const rms = computeRms(f32);
+        const peak = computePeak(f32);
         updateLocalNoiseFloor(rms);
         const i16 = downsampleToInt16(f32, nativeRate, SAMPLE_RATE);
         const audioBuffer = i16.buffer.slice(0);
         if (shouldGateMicDuringPlayback()) {
           bufferMicChunk(audioBuffer);
-          maybeInterruptForLocalSpeech(rms);
+          maybeInterruptForLocalSpeech(rms, peak);
           return;
         }
         handleLocalSpeechChunk(audioBuffer, rms);

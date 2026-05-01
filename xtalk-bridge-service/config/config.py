@@ -50,10 +50,59 @@ QWEN_ASR_TURN_DETECTION_SILENCE_MS = int(
 	os.getenv("QWEN_ASR_TURN_DETECTION_SILENCE_MS", "400"),
 )
 
+# ── Local Qwen3-ASR (open-source) ─────────────────────────────────────────────
+# Activate with: ASR_PROVIDER=qwen-local
+# vLLM backend is required for true streaming; transformers is a non-streaming
+# fallback that returns one transcript per VAD-ended utterance.
+QWEN_LOCAL_MODEL = os.getenv("QWEN_LOCAL_MODEL", "Qwen/Qwen3-ASR-0.6B")
+QWEN_LOCAL_BACKEND = os.getenv("QWEN_LOCAL_BACKEND", "vllm")  # vllm | transformers
+QWEN_LOCAL_DEVICE = os.getenv("QWEN_LOCAL_DEVICE", "cuda:0")
+QWEN_LOCAL_DTYPE = os.getenv("QWEN_LOCAL_DTYPE", "bfloat16")
+QWEN_LOCAL_LANGUAGE = os.getenv("QWEN_LOCAL_LANGUAGE", WHISPER_LANGUAGE)
+QWEN_LOCAL_MAX_NEW_TOKENS = int(os.getenv("QWEN_LOCAL_MAX_NEW_TOKENS", "64"))
+QWEN_LOCAL_GPU_MEMORY_UTILIZATION = float(
+	os.getenv("QWEN_LOCAL_GPU_MEMORY_UTILIZATION", "0.5"),
+)
+QWEN_LOCAL_ATTN_IMPLEMENTATION = os.getenv("QWEN_LOCAL_ATTN_IMPLEMENTATION", "")
+# Streaming policy — smaller chunks → lower partial latency, more compute.
+QWEN_LOCAL_STREAMING_CHUNK_MS = int(os.getenv("QWEN_LOCAL_STREAMING_CHUNK_MS", "480"))
+QWEN_LOCAL_UNFIXED_CHUNK_NUM = int(os.getenv("QWEN_LOCAL_UNFIXED_CHUNK_NUM", "2"))
+QWEN_LOCAL_UNFIXED_TOKEN_NUM = int(os.getenv("QWEN_LOCAL_UNFIXED_TOKEN_NUM", "5"))
+QWEN_LOCAL_CHUNK_SIZE_SEC = float(os.getenv("QWEN_LOCAL_CHUNK_SIZE_SEC", "2.0"))
+QWEN_LOCAL_PARTIAL_MIN_INTERVAL_MS = int(
+	os.getenv("QWEN_LOCAL_PARTIAL_MIN_INTERVAL_MS", "200"),
+)
+# VAD endpointing for the local engine (independent of the realtime cloud knobs).
+QWEN_LOCAL_ENERGY_THRESHOLD = float(os.getenv("QWEN_LOCAL_ENERGY_THRESHOLD", "200.0"))
+QWEN_LOCAL_SILENCE_MS = int(os.getenv("QWEN_LOCAL_SILENCE_MS", "600"))
+QWEN_LOCAL_MIN_SPEECH_MS = int(os.getenv("QWEN_LOCAL_MIN_SPEECH_MS", "200"))
+# OpenAI-compatible split-process mode (QWEN_LOCAL_BACKEND=openai).
+# Run `qwen-asr-serve` in a separate venv to avoid the transformers-version
+# conflict with omnivoice, then point this URL at it.
+QWEN_LOCAL_OPENAI_BASE_URL = os.getenv("QWEN_LOCAL_OPENAI_BASE_URL", "http://127.0.0.1:8910/v1")
+QWEN_LOCAL_OPENAI_API_KEY = os.getenv("QWEN_LOCAL_OPENAI_API_KEY", "EMPTY")
+QWEN_LOCAL_OPENAI_TIMEOUT_S = float(os.getenv("QWEN_LOCAL_OPENAI_TIMEOUT_S", "30.0"))
+
 # VAD
 VAD_ENERGY_THRESHOLD = float(os.getenv("VAD_ENERGY_THRESHOLD", "200.0"))
 VAD_SILENCE_MS = int(os.getenv("VAD_SILENCE_MS", "800"))
 VAD_PARTIAL_INTERVAL_MS = int(os.getenv("VAD_PARTIAL_INTERVAL_MS", "1500"))
+
+# ── Fast Enhancer (sherpa-onnx GTCRN speech denoiser) ────────────────────────
+# When enabled, every incoming microphone chunk is denoised before being fed to
+# ASR and before its RMS is used by the barge-in filter. This collapses the
+# noise floor toward zero, which is the single most effective way to stop
+# ambient noise (HVAC, keyboard, distant TV, speaker bleed) from falsely
+# interrupting the AI mid-sentence.
+SPEECH_ENHANCER_ENABLED = os.getenv("SPEECH_ENHANCER_ENABLED", "1").lower() not in {"0", "false", "no"}
+SPEECH_ENHANCER_MODEL = Path(
+	os.getenv(
+		"SPEECH_ENHANCER_MODEL",
+		str(ROOT_DIR / "pretrained_models" / "fast-enhancer" / "gtcrn_simple.onnx"),
+	)
+)
+SPEECH_ENHANCER_NUM_THREADS = int(os.getenv("SPEECH_ENHANCER_NUM_THREADS", "1"))
+SPEECH_ENHANCER_PROVIDER = os.getenv("SPEECH_ENHANCER_PROVIDER", "cpu")
 
 # TTS
 TTS_ENABLED = os.getenv("TTS_ENABLED", "1").lower() not in {"0", "false", "no"}
@@ -103,7 +152,16 @@ OMNIVOICE_GUIDANCE_SCALE = float(os.getenv("OMNIVOICE_GUIDANCE_SCALE", "2.0"))
 OMNIVOICE_SPEED = float(os.getenv("OMNIVOICE_SPEED", "1.0"))
 # Voice-cloning: path to 3–10 s reference audio + its transcript.
 # Leave both empty to use OmniVoice's auto-voice mode.
-OMNIVOICE_REF_AUDIO = os.getenv("OMNIVOICE_REF_AUDIO", "")
+_omnivoice_ref_audio_raw = os.getenv("OMNIVOICE_REF_AUDIO", "")
+# When the user supplies a relative path (e.g. `reference-audio/ref.wav`),
+# resolve it against this package's ROOT_DIR (xtalk-bridge-service/). Otherwise
+# the file is only found when the process happens to be launched with the
+# sidecar directory as CWD, which the start-all.sh launcher does not do.
+if _omnivoice_ref_audio_raw and not os.path.isabs(_omnivoice_ref_audio_raw):
+    _resolved = (ROOT_DIR / _omnivoice_ref_audio_raw).resolve()
+    OMNIVOICE_REF_AUDIO = str(_resolved) if _resolved.is_file() else _omnivoice_ref_audio_raw
+else:
+    OMNIVOICE_REF_AUDIO = _omnivoice_ref_audio_raw
 OMNIVOICE_REF_TEXT = os.getenv("OMNIVOICE_REF_TEXT", "")
 # Voice-design: comma-separated speaker attributes (e.g. "female, low pitch").
 # Mutually exclusive with REF_AUDIO; REF_AUDIO takes priority when both are set.

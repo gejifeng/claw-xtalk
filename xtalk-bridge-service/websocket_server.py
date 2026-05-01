@@ -3,7 +3,11 @@ import asyncio
 import base64
 import json
 import logging
+import os
+import time
+from collections import deque
 
+import numpy as np
 import websockets
 from websockets.server import WebSocketServerProtocol
 
@@ -17,44 +21,113 @@ log = logging.getLogger(__name__)
 # dead-time between consecutive sentences without overloading the device.
 TTS_MAX_CONCURRENT_SYNTH = 2
 
+# Audio filter gate for converting ASR speech_started into barge_in.
+# Uses median + EMA smoothing and sustained-activity constraints to reject
+# transient ambient noise while AI playback is active.
+#
+# Defaults are intentionally conservative to avoid jingle/keyboard/HVAC noise
+# being mistaken for the user trying to interrupt the AI.
+_BARGE_IN_MIN_RMS = float(os.getenv("SIDECAR_BARGE_IN_MIN_RMS", "380"))
+_BARGE_IN_NOISE_MULTIPLIER = float(os.getenv("SIDECAR_BARGE_IN_NOISE_MULTIPLIER", "3.6"))
+_BARGE_IN_NOISE_MARGIN = float(os.getenv("SIDECAR_BARGE_IN_NOISE_MARGIN", "180"))
+_BARGE_IN_MAX_CREST = float(os.getenv("SIDECAR_BARGE_IN_MAX_CREST", "9.0"))
+_BARGE_IN_MEDIAN_WINDOW = max(3, int(os.getenv("SIDECAR_BARGE_IN_MEDIAN_WINDOW", "5")))
+_BARGE_IN_EMA_ALPHA = min(1.0, max(0.01, float(os.getenv("SIDECAR_BARGE_IN_EMA_ALPHA", "0.25"))))
+_BARGE_IN_CONSECUTIVE_CHUNKS = max(1, int(os.getenv("SIDECAR_BARGE_IN_CONSECUTIVE_CHUNKS", "6")))
+_BARGE_IN_MIN_ACTIVE_MS = max(0, int(os.getenv("SIDECAR_BARGE_IN_MIN_ACTIVE_MS", "400")))
+_NOISE_FLOOR_EMA_ALPHA = min(1.0, max(0.01, float(os.getenv("SIDECAR_BARGE_IN_NOISE_EMA_ALPHA", "0.06"))))
+# When True (default), barge_in additionally requires a non-empty ASR partial
+# transcript to have arrived since playback started. Pure noise rarely produces
+# a partial transcript, so this single check eliminates almost all false trips.
+_BARGE_IN_REQUIRE_ASR_PARTIAL = os.getenv("SIDECAR_BARGE_IN_REQUIRE_ASR_PARTIAL", "1") not in ("0", "false", "False", "")
+# Minimum number of non-whitespace characters in the partial transcript before
+# it is considered "real speech". A single character is often a recognition
+# hallucination on noise.
+_BARGE_IN_MIN_PARTIAL_CHARS = max(1, int(os.getenv("SIDECAR_BARGE_IN_MIN_PARTIAL_CHARS", "2")))
+
+
+def _now_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
+def _pcm_rms_and_peak(pcm_bytes: bytes) -> tuple[float, float]:
+    if not pcm_bytes:
+        return 0.0, 0.0
+    # Defensive: np.frombuffer with int16 requires an even byte count. Browser
+    # MediaRecorder / WebSocket framing can occasionally deliver an odd-length
+    # tail; truncating the trailing byte is harmless for an RMS/peak estimate.
+    if len(pcm_bytes) % 2:
+        pcm_bytes = pcm_bytes[:-1]
+        if not pcm_bytes:
+            return 0.0, 0.0
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if samples.size == 0:
+        return 0.0, 0.0
+    audio = samples.astype(np.float32)
+    rms = float(np.sqrt(np.mean(audio * audio)))
+    peak = float(np.max(np.abs(audio)))
+    return rms, peak
+
 
 class _SessionState:
-    def __init__(self, session_id: str, asr_engine, tts, send_json):
+    def __init__(self, session_id: str, asr_engine, tts, send_json, enhancer=None):
         self.session_id = session_id
         self.turn_id: str | None = None
         self._asr_engine = asr_engine
         self.asr_stream = None
         self.tts = tts
         self._send_json = send_json
+        # Optional Fast Enhancer (sherpa-onnx GTCRN). When set, every PCM chunk
+        # the client sends us is denoised here before being forwarded to ASR
+        # and before its RMS feeds the barge-in energy gate.
+        self._enhancer = enhancer
         # text=None is the flush sentinel that marks end-of-stream.
         self.tts_queue: asyncio.Queue[tuple[str, str | None, int]] = asyncio.Queue()
         self.tts_generation = 0
         self.playback_active = False
         self.tts_seq = 0
         self.tts_worker: asyncio.Task | None = None
+        self._barge_in_recent_rms: deque[float] = deque(maxlen=_BARGE_IN_MEDIAN_WINDOW)
+        self._barge_in_smoothed_rms = 0.0
+        self._barge_in_noise_floor_rms = _BARGE_IN_MIN_RMS
+        self._barge_in_voiced_chunks = 0
+        self._barge_in_candidate_since_ms = 0
+        self._barge_in_pending_turn_id: str | None = None
+        # Tracks whether the ASR has produced a non-trivial partial transcript
+        # since AI playback became active. Used as the strongest gate to block
+        # noise-induced barge_in events.
+        self._barge_in_partial_seen = False
 
     async def set_turn(self, turn_id: str) -> None:
         await self._cancel_asr()
         self.turn_id = turn_id
         self.reset_tts()
         expected_turn_id = turn_id
+        self._reset_barge_in_gate(clear_noise_floor=False)
 
         async def on_speech_started() -> None:
             if self.turn_id != expected_turn_id:
                 return
             if not self.playback_active:
                 return
-            await self._send_json(
-                {
-                    "type": "barge_in",
-                    "sessionId": self.session_id,
-                    "turnId": expected_turn_id,
-                }
-            )
+            # Do not interrupt immediately. Wait for filtered sustained-energy
+            # confirmation from incoming audio chunks.
+            self._barge_in_pending_turn_id = expected_turn_id
+            log.debug("[%s] speech_started received, waiting for filter confirmation", self.session_id)
 
         async def on_partial(text: str) -> None:
             if self.turn_id != expected_turn_id or not text:
                 return
+            # Mark that real text was recognized in this turn. This gates the
+            # barge_in filter so pure ambient noise (which rarely produces a
+            # transcript) cannot interrupt the AI.
+            stripped = text.strip()
+            if len(stripped) >= _BARGE_IN_MIN_PARTIAL_CHARS:
+                self._barge_in_partial_seen = True
+                # An ASR partial is itself a strong barge-in signal; try to
+                # emit the pending barge_in immediately if the energy gate has
+                # already accumulated enough evidence.
+                await self._maybe_emit_filtered_barge_in()
             await self._send_json(
                 {
                     "type": "asr.partial",
@@ -113,7 +186,27 @@ class _SessionState:
     async def send_audio(self, pcm_bytes: bytes) -> None:
         if self.asr_stream is None:
             return
-        await self.asr_stream.send_audio(pcm_bytes)
+        # Browser MediaRecorder can emit odd-length PCM tails. Every downstream
+        # consumer (Fast Enhancer, RMS gate, ASR engine) interprets the buffer
+        # as int16 samples and crashes on `np.frombuffer` if the length is odd.
+        # Trim once here so a single bad frame doesn't tear down the whole WS
+        # connection (which would otherwise leave the UI stuck in `transcribing`).
+        if pcm_bytes and len(pcm_bytes) % 2:
+            pcm_bytes = pcm_bytes[:-1]
+        # Run Fast Enhancer first so that downstream consumers (ASR transcript
+        # quality, barge-in RMS gate) all see a denoised signal. Heavy lifting
+        # is offloaded to a worker thread to keep the asyncio loop responsive.
+        if self._enhancer is not None and pcm_bytes:
+            try:
+                pcm_bytes = await asyncio.to_thread(self._enhancer.enhance_pcm16, pcm_bytes)
+            except Exception:
+                log.exception("[%s] Fast Enhancer error; passing raw audio through", self.session_id)
+        self._update_barge_in_filter(pcm_bytes)
+        await self._maybe_emit_filtered_barge_in()
+        try:
+            await self.asr_stream.send_audio(pcm_bytes)
+        except Exception:
+            log.exception("[%s] ASR send_audio failed; dropping frame", self.session_id)
 
     async def finish_audio(self) -> None:
         if self.asr_stream is None:
@@ -141,12 +234,108 @@ class _SessionState:
         self.tts_generation += 1
         self.playback_active = False
         self.tts_seq = 0
+        self._barge_in_pending_turn_id = None
+        self._reset_barge_in_gate(clear_noise_floor=False)
         while True:
             try:
                 self.tts_queue.get_nowait()
                 self.tts_queue.task_done()
             except asyncio.QueueEmpty:
                 break
+
+    def _reset_barge_in_gate(self, *, clear_noise_floor: bool) -> None:
+        self._barge_in_recent_rms.clear()
+        self._barge_in_smoothed_rms = 0.0
+        self._barge_in_voiced_chunks = 0
+        self._barge_in_candidate_since_ms = 0
+        self._barge_in_partial_seen = False
+        if clear_noise_floor:
+            self._barge_in_noise_floor_rms = _BARGE_IN_MIN_RMS
+
+    def _update_barge_in_filter(self, pcm_bytes: bytes) -> None:
+        rms, peak = _pcm_rms_and_peak(pcm_bytes)
+        if rms <= 0.0:
+            return
+
+        self._barge_in_recent_rms.append(rms)
+        median_rms = float(np.median(np.asarray(self._barge_in_recent_rms, dtype=np.float32)))
+        if self._barge_in_smoothed_rms <= 0:
+            self._barge_in_smoothed_rms = median_rms
+        else:
+            self._barge_in_smoothed_rms = (
+                ((1.0 - _BARGE_IN_EMA_ALPHA) * self._barge_in_smoothed_rms)
+                + (_BARGE_IN_EMA_ALPHA * median_rms)
+            )
+
+        crest = peak / max(self._barge_in_smoothed_rms, 1e-6)
+
+        if not self.playback_active:
+            self._barge_in_noise_floor_rms = (
+                ((1.0 - _NOISE_FLOOR_EMA_ALPHA) * self._barge_in_noise_floor_rms)
+                + (_NOISE_FLOOR_EMA_ALPHA * min(self._barge_in_smoothed_rms, _BARGE_IN_MIN_RMS * 4.0))
+            )
+            self._barge_in_voiced_chunks = 0
+            self._barge_in_candidate_since_ms = 0
+            return
+
+        if crest > _BARGE_IN_MAX_CREST:
+            self._barge_in_voiced_chunks = 0
+            self._barge_in_candidate_since_ms = 0
+            return
+
+        threshold = max(
+            _BARGE_IN_MIN_RMS,
+            (self._barge_in_noise_floor_rms * _BARGE_IN_NOISE_MULTIPLIER) + _BARGE_IN_NOISE_MARGIN,
+        )
+        if self._barge_in_smoothed_rms >= threshold:
+            if self._barge_in_voiced_chunks == 0:
+                self._barge_in_candidate_since_ms = _now_ms()
+            self._barge_in_voiced_chunks += 1
+        else:
+            self._barge_in_voiced_chunks = 0
+            self._barge_in_candidate_since_ms = 0
+
+    def _barge_in_filter_ready(self) -> bool:
+        if self._barge_in_voiced_chunks < _BARGE_IN_CONSECUTIVE_CHUNKS:
+            return False
+        if self._barge_in_candidate_since_ms <= 0:
+            return False
+        active_ms = _now_ms() - self._barge_in_candidate_since_ms
+        if active_ms < _BARGE_IN_MIN_ACTIVE_MS:
+            return False
+        return True
+
+    async def _maybe_emit_filtered_barge_in(self) -> None:
+        pending_turn_id = self._barge_in_pending_turn_id
+        if pending_turn_id is None:
+            return
+        if not self.playback_active:
+            self._barge_in_pending_turn_id = None
+            return
+        if pending_turn_id != self.turn_id:
+            self._barge_in_pending_turn_id = None
+            return
+        if not self._barge_in_filter_ready():
+            return
+        # Strongest gate: real ASR text must have appeared, otherwise treat the
+        # energy spike as ambient noise and refuse to interrupt the AI.
+        if _BARGE_IN_REQUIRE_ASR_PARTIAL and not self._barge_in_partial_seen:
+            log.debug(
+                "[%s] barge_in suppressed: energy gate passed but no ASR partial yet",
+                self.session_id,
+            )
+            return
+
+        self._barge_in_pending_turn_id = None
+        self._barge_in_voiced_chunks = 0
+        self._barge_in_candidate_since_ms = 0
+        await self._send_json(
+            {
+                "type": "barge_in",
+                "sessionId": self.session_id,
+                "turnId": pending_turn_id,
+            }
+        )
 
     async def close(self) -> None:
         await self._cancel_asr()
@@ -166,11 +355,13 @@ class BridgeWebSocketServer:
         port: int = 7431,
         asr_engine=None,
         tts_engine=None,
+        enhancer=None,
     ):
         self._host = host
         self._port = port
         self._asr_engine = asr_engine
         self._tts_engine = tts_engine
+        self._enhancer = enhancer
 
     async def start(self):
         log.info("X-Talk sidecar listening on ws://%s:%s", self._host, self._port)
@@ -207,6 +398,7 @@ class BridgeWebSocketServer:
                             self._asr_engine,
                             self._tts_engine,
                             lambda payload: self._send(ws, payload),
+                            enhancer=self._enhancer,
                         )
                         sessions[session_id] = sess
                     turn_id = msg.get("turnId")
@@ -401,6 +593,10 @@ class BridgeWebSocketServer:
                 if audio:
                     if not sess.playback_active:
                         sess.playback_active = True
+                        # Reset the barge-in ASR-partial gate so any partial
+                        # that may have been received *before* the AI started
+                        # speaking does not count as evidence of barge-in.
+                        sess._barge_in_partial_seen = False
                         await self._send(ws, {
                             "type": "playback.started",
                             "sessionId": sess.session_id,
@@ -419,8 +615,13 @@ class BridgeWebSocketServer:
 
                 send_seq += 1
 
-            # All chunks delivered → notify client
-            if sess.tts_generation == generation and sess.playback_active:
+            # All chunks delivered → notify client.
+            # IMPORTANT: even when every chunk synthesised to empty bytes
+            # (e.g. TTS provider misconfigured), we still need to send
+            # `playback.finished` so the UI can leave the `transcribing`
+            # state and accept the next user turn. Without this, a single TTS
+            # outage would freeze the conversation indefinitely.
+            if sess.tts_generation == generation and (total or 0) > 0:
                 await self._send(ws, {
                     "type": "playback.finished",
                     "sessionId": sess.session_id,

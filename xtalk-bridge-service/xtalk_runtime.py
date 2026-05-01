@@ -33,6 +33,124 @@ class ASRUnavailableError(RuntimeError):
     pass
 
 
+class SpeechEnhancerUnavailableError(RuntimeError):
+    pass
+
+
+class SpeechEnhancer:
+    """Lightweight speech denoiser based on k2-fsa sherpa-onnx GTCRN ("Fast Enhancer").
+
+    Strips stationary background noise (HVAC, fan, keyboard hiss, distant TV,
+    speaker bleed during AI playback) from incoming 16 kHz mono PCM-16 audio.
+    The model is < 1 MB and runs at RTF ~ 0.07 on a single CPU thread, so it
+    can sit on the realtime audio path with negligible added latency
+    (~3 ms per 60 ms chunk).
+
+    The denoiser is fed every microphone chunk *before* it is forwarded to the
+    ASR or used to compute barge-in energy. After denoising, ambient noise
+    collapses to ~0 RMS, which is the single biggest reason it fixes the
+    "AI gets interrupted by noise mid-sentence" failure mode.
+
+    Voice-only spec: input is 16-bit signed-integer mono PCM at 16 kHz; output
+    is the same format and length, ready to be fed to either ASR or RMS
+    computation.
+    """
+
+    SAMPLE_RATE = 16000
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        num_threads: int = 1,
+        provider: str = "cpu",
+    ):
+        self._model_path = str(model_path)
+        self._num_threads = max(1, int(num_threads))
+        self._provider = provider
+        self._denoiser = None
+        self._lock = None
+        self._init_denoiser()
+
+    def _init_denoiser(self) -> None:
+        if not Path(self._model_path).exists():
+            raise SpeechEnhancerUnavailableError(
+                f"Fast Enhancer model not found at {self._model_path}; "
+                "run scripts/bootstrap_fast_enhancer.py first",
+            )
+        try:
+            import sherpa_onnx
+        except ImportError as exc:
+            raise SpeechEnhancerUnavailableError(
+                "sherpa-onnx is not installed; run: pip install sherpa-onnx",
+            ) from exc
+
+        config = sherpa_onnx.OfflineSpeechDenoiserConfig(
+            model=sherpa_onnx.OfflineSpeechDenoiserModelConfig(
+                gtcrn=sherpa_onnx.OfflineSpeechDenoiserGtcrnModelConfig(
+                    model=self._model_path,
+                ),
+                num_threads=self._num_threads,
+                debug=False,
+                provider=self._provider,
+            )
+        )
+        if not config.validate():
+            raise SpeechEnhancerUnavailableError(
+                f"Fast Enhancer config invalid for model {self._model_path}",
+            )
+
+        log.info(
+            "Loading Fast Enhancer (sherpa-onnx GTCRN) model=%s provider=%s threads=%d",
+            self._model_path,
+            self._provider,
+            self._num_threads,
+        )
+        t0 = time.perf_counter()
+        self._denoiser = sherpa_onnx.OfflineSpeechDenoiser(config)
+        # Single-instance ONNX inference is not necessarily thread-safe; serialise
+        # access from the asyncio thread pool with a threading.Lock.
+        import threading
+        self._lock = threading.Lock()
+        log.info("Fast Enhancer ready in %.0f ms", (time.perf_counter() - t0) * 1000)
+
+    @property
+    def sample_rate(self) -> int:
+        return self.SAMPLE_RATE
+
+    def enhance_pcm16(self, pcm_bytes: bytes) -> bytes:
+        """Denoise a chunk of 16 kHz mono PCM-16 audio.
+
+        Returns a bytes object of the same length as the input. On any internal
+        failure the original bytes are returned unchanged so the audio path
+        never goes silent.
+        """
+        if self._denoiser is None or not pcm_bytes:
+            return pcm_bytes
+        try:
+            samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+            if samples.size == 0:
+                return pcm_bytes
+            audio_f32 = samples.astype(np.float32) / 32768.0
+            with self._lock:
+                result = self._denoiser.run(audio_f32, self.SAMPLE_RATE)
+            denoised = np.asarray(result.samples, dtype=np.float32)
+            # GTCRN may return a slightly shorter/longer tail (FFT framing).
+            # Pad/truncate to match the input length so downstream code can rely
+            # on chunk-size invariants.
+            if denoised.size != samples.size:
+                if denoised.size > samples.size:
+                    denoised = denoised[: samples.size]
+                else:
+                    pad = np.zeros(samples.size - denoised.size, dtype=np.float32)
+                    denoised = np.concatenate([denoised, pad])
+            denoised = np.clip(denoised, -1.0, 1.0)
+            pcm16 = (denoised * 32767.0).astype(np.int16)
+            return pcm16.tobytes()
+        except Exception:
+            log.exception("Fast Enhancer failed; falling back to raw audio")
+            return pcm_bytes
+
+
 def time_ms() -> int:
     return time.time_ns() // 1_000_000
 
@@ -895,3 +1013,521 @@ class QwenRealtimeASRSession:
             "endpointWaitMs": latency_ms,
             "transcribeDurationMs": 0,
         }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local Qwen3-ASR (open-source) — true streaming via vLLM backend, with a
+# transformers backend as a non-streaming fallback. Loaded once at startup;
+# every turn gets its own per-session streaming state.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_LANGUAGE_CODE_TO_NAME = {
+    "zh": "Chinese",
+    "en": "English",
+    "yue": "Cantonese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "fr": "French",
+    "de": "German",
+    "es": "Spanish",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "ar": "Arabic",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "id": "Indonesian",
+    "ms": "Malay",
+    "nl": "Dutch",
+    "tr": "Turkish",
+    "hi": "Hindi",
+    "pl": "Polish",
+}
+
+
+def _normalize_qwen_language(language: str | None) -> str | None:
+    if not language:
+        return None
+    code = language.strip().lower()
+    if not code:
+        return None
+    return _LANGUAGE_CODE_TO_NAME.get(code, language)
+
+
+class Qwen3LocalASREngine:
+    """Local open-source Qwen3-ASR engine (vLLM streaming or transformers).
+
+    The model is loaded once at startup and reused across turns. Each call to
+    ``create_session`` returns a fresh per-turn session that owns its own
+    streaming state, so concurrent turns from different browser tabs do not
+    interfere with each other.
+
+    Backends:
+      * ``vllm`` (recommended for single-venv deploys): true streaming inference
+        via ``Qwen3ASRModel.LLM(...)`` and ``streaming_transcribe(...)``.
+        Requires ``pip install qwen-asr[vllm]`` and a CUDA GPU. Conflicts
+        with ``omnivoice`` because of incompatible transformers pins.
+      * ``transformers``: non-streaming fallback using ``model.transcribe(...)``
+        on the full VAD-segmented utterance. Same dependency conflict as vllm.
+      * ``openai``: split-process mode — talks to an external
+        ``qwen-asr-serve`` instance over its OpenAI-compatible HTTP API.
+        This sidecar venv stays free of qwen-asr/vllm so it can keep using
+        omnivoice. No streaming partials; one final per VAD utterance.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        backend: str = "vllm",
+        device: str = "cuda:0",
+        dtype: str = "bfloat16",
+        language: str | None = "zh",
+        max_new_tokens: int = 64,
+        gpu_memory_utilization: float = 0.5,
+        attn_implementation: str | None = None,
+        # Streaming policy
+        streaming_chunk_ms: int = 480,
+        unfixed_chunk_num: int = 2,
+        unfixed_token_num: int = 5,
+        chunk_size_sec: float = 2.0,
+        partial_min_interval_ms: int = 200,
+        # VAD endpointing
+        energy_threshold: float = 200.0,
+        silence_limit_ms: int = 600,
+        min_speech_ms: int = 200,
+    ):
+        self._model_path = model_path
+        self._backend = backend.lower().strip()
+        self._device = device
+        self._dtype = dtype
+        self._language = _normalize_qwen_language(language)
+        self._max_new_tokens = max_new_tokens
+        self._gpu_memory_utilization = gpu_memory_utilization
+        self._attn_implementation = attn_implementation or None
+        self._streaming_chunk_ms = max(80, int(streaming_chunk_ms))
+        self._unfixed_chunk_num = unfixed_chunk_num
+        self._unfixed_token_num = unfixed_token_num
+        self._chunk_size_sec = chunk_size_sec
+        self._partial_min_interval_ms = partial_min_interval_ms
+        self._energy_threshold = energy_threshold
+        self._silence_limit_ms = silence_limit_ms
+        self._min_speech_ms = min_speech_ms
+
+        if self._backend not in {"vllm", "transformers", "openai"}:
+            raise ASRUnavailableError(
+                f"Unsupported QWEN_LOCAL_BACKEND={backend!r}; use 'vllm', 'transformers', or 'openai'",
+            )
+
+        self._model = None
+        self._model_lock = None  # type: ignore[assignment]
+        # openai backend extras (set via configure_openai())
+        self._openai_base_url: str | None = None
+        self._openai_api_key: str = "EMPTY"
+        self._openai_timeout_s: float = 30.0
+        if self._backend != "openai":
+            self._init_model()
+        else:
+            import threading
+            self._model_lock = threading.Lock()
+            log.info(
+                "Configured local Qwen3-ASR in split-process (openai) mode  model=%s",
+                model_path,
+            )
+
+    def configure_openai(self, *, base_url: str, api_key: str = "EMPTY", timeout_s: float = 30.0) -> None:
+        if self._backend != "openai":
+            return
+        self._openai_base_url = base_url.rstrip("/")
+        self._openai_api_key = api_key or "EMPTY"
+        self._openai_timeout_s = timeout_s
+        log.info(
+            "Local Qwen3-ASR openai backend  url=%s  model=%s  timeout=%.1fs",
+            self._openai_base_url,
+            self._model_path,
+            timeout_s,
+        )
+
+    def _init_model(self) -> None:
+        try:
+            import torch  # type: ignore[reportMissingImports]
+            from qwen_asr import Qwen3ASRModel  # type: ignore[reportMissingImports]
+        except ImportError as exc:
+            raise ASRUnavailableError(
+                "qwen-asr is not installed; run: pip install -U qwen-asr"
+                + (" [vllm]" if self._backend == "vllm" else ""),
+            ) from exc
+
+        torch_dtype = getattr(torch, self._dtype, None)
+        if torch_dtype is None:
+            raise ASRUnavailableError(f"Unknown torch dtype: {self._dtype!r}")
+
+        log.info(
+            "Loading local Qwen3-ASR  backend=%s  model=%s  device=%s  dtype=%s",
+            self._backend,
+            self._model_path,
+            self._device,
+            self._dtype,
+        )
+        t0 = time.perf_counter()
+        if self._backend == "vllm":
+            kwargs = dict(
+                model=self._model_path,
+                gpu_memory_utilization=self._gpu_memory_utilization,
+                max_new_tokens=self._max_new_tokens,
+            )
+            try:
+                self._model = Qwen3ASRModel.LLM(**kwargs)
+            except Exception as exc:
+                raise ASRUnavailableError(
+                    f"Failed to initialise Qwen3-ASR vLLM backend: {exc}",
+                ) from exc
+        else:
+            tf_kwargs = dict(
+                dtype=torch_dtype,
+                device_map=self._device,
+                max_inference_batch_size=1,
+                max_new_tokens=self._max_new_tokens,
+            )
+            if self._attn_implementation:
+                tf_kwargs["attn_implementation"] = self._attn_implementation
+            try:
+                self._model = Qwen3ASRModel.from_pretrained(self._model_path, **tf_kwargs)
+            except Exception as exc:
+                raise ASRUnavailableError(
+                    f"Failed to load Qwen3-ASR transformers backend: {exc}",
+                ) from exc
+        import threading
+        # Serialise model access; Qwen3ASRModel is not guaranteed thread-safe
+        # for concurrent streaming_transcribe calls across sessions on the same
+        # state, and the underlying engine batches internally anyway.
+        self._model_lock = threading.Lock()
+        log.info(
+            "Local Qwen3-ASR ready in %.1f s  (chunk=%dms  silence=%dms  language=%s)",
+            time.perf_counter() - t0,
+            self._streaming_chunk_ms,
+            self._silence_limit_ms,
+            self._language or "<auto>",
+        )
+
+    def create_session(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        on_speech_started: AsrSpeechStartedCallback,
+        on_partial: AsrPartialCallback,
+        on_final: AsrFinalCallback,
+        on_error: AsrErrorCallback,
+    ):
+        return Qwen3LocalASRSession(
+            engine=self,
+            session_id=session_id,
+            turn_id=turn_id,
+            on_speech_started=on_speech_started,
+            on_partial=on_partial,
+            on_final=on_final,
+            on_error=on_error,
+        )
+
+
+class Qwen3LocalASRSession:
+    """Per-turn session for the local Qwen3-ASR engine.
+
+    Streaming flow (vLLM backend):
+      1. Browser PCM-16 chunks arrive; we VAD-gate them on energy.
+      2. After speech starts we accumulate samples into a streaming-chunk
+         buffer (~480 ms).  Each full buffer is fed to ``streaming_transcribe``
+         off the asyncio thread, and any new prefix in ``state.text`` is
+         emitted as an ASR partial.
+      3. When silence persists for ``silence_limit_ms`` we drain the buffer,
+         call ``finish_streaming_transcribe``, and emit the final transcript.
+
+    Transformers backend behaves the same externally but only emits a single
+    final transcript at end-of-utterance (no streaming partials).
+    """
+
+    def __init__(
+        self,
+        engine: Qwen3LocalASREngine,
+        session_id: str,
+        turn_id: str,
+        on_speech_started: AsrSpeechStartedCallback,
+        on_partial: AsrPartialCallback,
+        on_final: AsrFinalCallback,
+        on_error: AsrErrorCallback,
+    ):
+        self._engine = engine
+        self._session_id = session_id
+        self._turn_id = turn_id
+        self._on_speech_started = on_speech_started
+        self._on_partial = on_partial
+        self._on_final = on_final
+        self._on_error = on_error
+
+        self._streaming_chunk_samples = int(SAMPLE_RATE * engine._streaming_chunk_ms / 1000)
+        self._silence_limit_ms = engine._silence_limit_ms
+        self._min_speech_samples = int(SAMPLE_RATE * engine._min_speech_ms / 1000)
+
+        self._state = None
+        self._buffer: list[np.ndarray] = []
+        self._buffer_samples = 0
+        self._utterance_samples = 0
+        self._silent_ms = 0.0
+        self._is_speaking = False
+        self._last_partial_text = ""
+        self._last_partial_at_ms = 0
+        self._first_audio_at_ms: int | None = None
+        self._last_audio_at_ms: int | None = None
+        self._speech_started_at_ms: int | None = None
+        self._finalized = False
+        self._cancelled = False
+
+    async def start(self) -> None:
+        if self._engine._backend == "vllm" and self._state is None:
+            await asyncio.to_thread(self._init_streaming_state)
+        # transformers / openai backends have no per-session warmup
+
+    def _init_streaming_state(self) -> None:
+        with self._engine._model_lock:
+            self._state = self._engine._model.init_streaming_state(
+                unfixed_chunk_num=self._engine._unfixed_chunk_num,
+                unfixed_token_num=self._engine._unfixed_token_num,
+                chunk_size_sec=self._engine._chunk_size_sec,
+                language=self._engine._language,
+            )
+
+    async def send_audio(self, pcm_bytes: bytes) -> None:
+        if self._cancelled or self._finalized or not pcm_bytes:
+            return
+        try:
+            await self.start()
+            samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            if samples.size == 0:
+                return
+
+            now_ms = time_ms()
+            self._last_audio_at_ms = now_ms
+            if self._first_audio_at_ms is None:
+                self._first_audio_at_ms = now_ms
+            chunk_ms = (samples.size / SAMPLE_RATE) * 1000.0
+            rms = float(np.sqrt(np.mean(samples * samples))) * 32768.0
+
+            if rms > self._engine._energy_threshold:
+                if not self._is_speaking:
+                    self._is_speaking = True
+                    self._speech_started_at_ms = now_ms
+                    await self._on_speech_started()
+                self._silent_ms = 0.0
+                self._append(samples)
+            elif self._is_speaking:
+                # Keep trailing silence in the buffer so the model sees natural
+                # endings, but track silence to decide when to finalise.
+                self._silent_ms += chunk_ms
+                self._append(samples)
+                if self._silent_ms >= self._silence_limit_ms:
+                    await self._finalize_utterance(reason="vad-silence")
+                    return
+
+            # Drain whenever we have enough audio for a streaming step.
+            if (
+                self._engine._backend == "vllm"
+                and self._is_speaking
+                and self._buffer_samples >= self._streaming_chunk_samples
+            ):
+                await self._drain_streaming_chunk()
+        except Exception as exc:  # pragma: no cover - runtime dependent
+            log.exception(
+                "Qwen3 local ASR send_audio failed session=%s turn=%s",
+                self._session_id,
+                self._turn_id,
+            )
+            await self._on_error(f"ASR failed: {exc}")
+
+    async def finish(self) -> None:
+        if self._cancelled or self._finalized:
+            return
+        try:
+            await self._finalize_utterance(reason="client-finish")
+        except Exception as exc:  # pragma: no cover - runtime dependent
+            log.exception(
+                "Qwen3 local ASR finish failed session=%s turn=%s",
+                self._session_id,
+                self._turn_id,
+            )
+            await self._on_error(f"ASR finish failed: {exc}")
+
+    async def cancel(self) -> None:
+        self._cancelled = True
+        if self._state is not None and self._engine._backend == "vllm":
+            try:
+                await asyncio.to_thread(self._abort_state)
+            except Exception:
+                log.debug("Qwen3 local ASR cancel: state abort failed", exc_info=True)
+        self._reset_buffers()
+
+    # ── internals ────────────────────────────────────────────────────────
+
+    def _append(self, samples: np.ndarray) -> None:
+        self._buffer.append(samples)
+        self._buffer_samples += samples.size
+        self._utterance_samples += samples.size
+
+    def _reset_buffers(self) -> None:
+        self._buffer = []
+        self._buffer_samples = 0
+
+    def _abort_state(self) -> None:
+        # qwen-asr has no public cancel; finishing on the worker is cheap.
+        try:
+            with self._engine._model_lock:
+                self._engine._model.finish_streaming_transcribe(self._state)
+        finally:
+            self._state = None
+
+    async def _drain_streaming_chunk(self) -> None:
+        if not self._buffer:
+            return
+        chunk = np.concatenate(self._buffer)
+        self._reset_buffers()
+        await asyncio.to_thread(self._streaming_transcribe, chunk)
+        text = (getattr(self._state, "text", "") or "").strip()
+        if not text or text == self._last_partial_text:
+            return
+        now_ms = time_ms()
+        if (now_ms - self._last_partial_at_ms) < self._engine._partial_min_interval_ms:
+            return
+        self._last_partial_text = text
+        self._last_partial_at_ms = now_ms
+        await self._on_partial(text)
+
+    def _streaming_transcribe(self, chunk: np.ndarray) -> None:
+        with self._engine._model_lock:
+            self._engine._model.streaming_transcribe(chunk, self._state)
+
+    async def _finalize_utterance(self, *, reason: str) -> None:
+        if self._finalized:
+            return
+        self._finalized = True
+
+        # Drop ultra-short blips that are almost certainly noise.
+        if self._utterance_samples < self._min_speech_samples and not self._last_partial_text:
+            self._reset_buffers()
+            return
+
+        speech_ended_at_ms = self._last_audio_at_ms or time_ms()
+        transcribe_started_at_ms = time_ms()
+
+        text = ""
+        if self._engine._backend == "vllm":
+            # Push any tail audio still pending into the streaming state.
+            if self._buffer:
+                chunk = np.concatenate(self._buffer)
+                self._reset_buffers()
+                await asyncio.to_thread(self._streaming_transcribe, chunk)
+            await asyncio.to_thread(self._finish_streaming)
+            text = (getattr(self._state, "text", "") or "").strip()
+            self._state = None
+        else:
+            # transformers / openai backends: one-shot transcribe over the
+            # whole utterance.
+            audio = (
+                np.concatenate(self._buffer) if self._buffer else np.zeros(0, dtype=np.float32)
+            )
+            self._reset_buffers()
+            if audio.size == 0:
+                return
+            if self._engine._backend == "openai":
+                text = await asyncio.to_thread(self._openai_transcribe, audio)
+            else:
+                text = await asyncio.to_thread(self._transformers_transcribe, audio)
+
+        transcribe_finished_at_ms = time_ms()
+
+        if not text:
+            log.debug(
+                "Qwen3 local ASR finalised with empty transcript session=%s reason=%s",
+                self._session_id,
+                reason,
+            )
+            return
+
+        timing = {
+            "speechEndedAtMs": speech_ended_at_ms,
+            "sttLatencyMs": transcribe_finished_at_ms - speech_ended_at_ms,
+            "endpointWaitMs": transcribe_started_at_ms - speech_ended_at_ms,
+            "transcribeDurationMs": transcribe_finished_at_ms - transcribe_started_at_ms,
+        }
+        await self._on_final(text, timing)
+
+    def _finish_streaming(self) -> None:
+        with self._engine._model_lock:
+            self._engine._model.finish_streaming_transcribe(self._state)
+
+    def _transformers_transcribe(self, audio: np.ndarray) -> str:
+        with self._engine._model_lock:
+            results = self._engine._model.transcribe(
+                audio=(audio, SAMPLE_RATE),
+                language=self._engine._language,
+            )
+        if not results:
+            return ""
+        text = getattr(results[0], "text", "") or ""
+        return text.strip()
+
+    def _openai_transcribe(self, audio: np.ndarray) -> str:
+        """Send the buffered utterance to an external qwen-asr-serve instance.
+
+        Uses the OpenAI-compatible chat-completions endpoint with an inline
+        base64 wav data URL, then strips the standard ``<|...|>`` language
+        prefix that qwen-asr emits.
+        """
+        engine = self._engine
+        if not engine._openai_base_url:
+            raise ASRUnavailableError(
+                "openai backend selected but QWEN_LOCAL_OPENAI_BASE_URL is not configured",
+            )
+        try:
+            import urllib.request
+            import json as _json
+        except Exception as exc:  # pragma: no cover - stdlib always present
+            raise ASRUnavailableError(f"stdlib unavailable: {exc}") from exc
+
+        wav_bytes = _wav_bytes_from_float32(audio, SAMPLE_RATE)
+        audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+        data_url = f"data:audio/wav;base64,{audio_b64}"
+        payload = {
+            "model": engine._model_path,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio_url", "audio_url": {"url": data_url}},
+                    ],
+                }
+            ],
+            "temperature": 0.0,
+            "max_tokens": engine._max_new_tokens,
+        }
+        req = urllib.request.Request(
+            f"{engine._openai_base_url}/chat/completions",
+            data=_json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {engine._openai_api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=engine._openai_timeout_s) as resp:
+                body = resp.read()
+        except Exception as exc:
+            raise ASRUnavailableError(f"qwen-asr-serve request failed: {exc}") from exc
+        try:
+            data = _json.loads(body.decode("utf-8"))
+            content = data["choices"][0]["message"]["content"]
+        except Exception as exc:
+            raise ASRUnavailableError(f"qwen-asr-serve returned malformed response: {exc}") from exc
+        # qwen-asr formats the content as "<|Chinese|>你好。"; strip the prefix.
+        text = re.sub(r"^\s*<\|[^|]+\|>\s*", "", content or "").strip()
+        return text

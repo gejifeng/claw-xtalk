@@ -3,7 +3,37 @@ numpy>=1.24.0
 faster-whisper>=1.0.0
 huggingface-hub>=0.24.0
 dashscope>=1.25.6
-# OmniVoice local TTS (only required when TTS_PROVIDER=omnivoice)
+# Fast Enhancer (sherpa-onnx GTCRN speech denoiser) — filters mic noise on the
+# realtime audio path so the AI is no longer interrupted by ambient sound.
+# Run scripts/bootstrap_fast_enhancer.py once to download the < 1 MB model.
+sherpa-onnx>=1.10.0
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional local engines — DO NOT enable both in the same venv.
+#
+# omnivoice pins `transformers>=5.3.0` while qwen-asr pins `transformers==4.57.6`,
+# so the two CANNOT coexist in a single Python environment.
+#
+# Pick ONE of the two strategies below:
+#
+#   1) Single-venv mode  — pick whichever local engine you actually use and
+#      uncomment ONE of the two lines below. Leave the other commented out.
+#
+#   2) Split-process mode (recommended when you want both local TTS and local
+#      ASR) — keep both lines commented here, then:
+#        * install `omnivoice` in this venv  (sidecar process)
+#        * install `qwen-asr[vllm]` in a SEPARATE venv and run the official
+#          OpenAI-compatible server:
+#               qwen-asr-serve Qwen/Qwen3-ASR-0.6B --host 127.0.0.1 --port 8910
+#        * point the sidecar at it with:
+#               ASR_PROVIDER=qwen-local
+#               QWEN_LOCAL_BACKEND=openai
+#               QWEN_LOCAL_OPENAI_BASE_URL=http://127.0.0.1:8910/v1
+# ─────────────────────────────────────────────────────────────────────────────
+
+# OmniVoice local TTS (only required when TTS_PROVIDER=omnivoice).
 # Install PyTorch for your CUDA version first: https://pytorch.org/get-started/locally/
-# then: pip install omnivoice
-omnivoice>=0.1.4
+# omnivoice>=0.1.4
+
+# Local Qwen3-ASR (only required when ASR_PROVIDER=qwen-local with backend=vllm/transformers).
+# For true streaming on a CUDA GPU install with the [vllm] extra.
+# qwen-asr[vllm]>=0.0.6

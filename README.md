@@ -18,6 +18,8 @@ The current alpha focuses on a usable demo loop rather than product packaging:
 - multi-turn conversation continuity
 - browser-side local VAD segmentation to reduce noise-triggered turns
 - filler/noise transcript suppression for low-value ASR fragments
+- **Fast Enhancer (sherpa-onnx GTCRN) noise denoiser** on the realtime mic path
+  to stop background noise from falsely interrupting the AI mid-sentence
 
 ## Status
 
@@ -77,6 +79,7 @@ Design rules:
   - `xtalk_runtime.py` ASR and TTS runtime implementations
   - `config/config.py` runtime configuration loading
   - `scripts/bootstrap_cosyvoice.py` optional local CosyVoice bootstrap helper
+  - `scripts/bootstrap_fast_enhancer.py` downloads the Fast Enhancer (GTCRN) denoiser model
   - `reference-audio/` local reference material placeholder
 
 ## Main Components
@@ -116,11 +119,14 @@ Responsibilities:
 
 Supported provider modes:
 
-- `ASR_PROVIDER=qwen-realtime` for DashScope Qwen realtime ASR
+- `ASR_PROVIDER=qwen-realtime` for DashScope Qwen realtime ASR (cloud)
+- `ASR_PROVIDER=qwen-local` for local **Qwen3-ASR-0.6B** streaming (no API key)
 - `ASR_PROVIDER=whisper` for local fallback ASR
 - `TTS_PROVIDER=aliyun-cosyvoice` for DashScope CosyVoice
 - `TTS_PROVIDER=cosyvoice` for local CosyVoice fallback
 - `TTS_PROVIDER=omnivoice` for local OmniVoice (high-performance diffusion model, no API key needed)
+- **Fast Enhancer** (sherpa-onnx GTCRN, `SPEECH_ENHANCER_ENABLED=1`) — optional
+  realtime speech-denoiser front-end shared by every ASR provider
 
 ## Runtime Requirements
 
@@ -141,6 +147,114 @@ Expected local ports:
 
 ## Quick Start
 
+The fastest path is the one-click launcher (recommended). Skip to
+[One-click launcher](#one-click-launcher-recommended) if you want
+everything brought up automatically.
+
+### One-click launcher (recommended)
+
+```bash
+cp xtalk-bridge-service/.env.example xtalk-bridge-service/.env
+# (optional) edit .env if you want to add DASHSCOPE_API_KEY for cloud TTS
+./scripts/start-all.sh
+```
+
+The launcher is fully self-contained and idempotent. On first run it will:
+
+1. Auto-install [`uv`](https://docs.astral.sh/uv/) if it is not on `PATH`
+   (via `curl -LsSf https://astral.sh/uv/install.sh | sh`).
+2. Create two isolated virtual environments:
+   - `./.venv` — sidecar + omnivoice (transformers >= 5.3)
+   - `./.venv-qwen-asr` — local Qwen3-ASR server (transformers == 4.57.6)
+   (the two transformers pins are incompatible, so they must live in
+   separate venvs and talk over an OpenAI-compatible HTTP API).
+3. Detect NVIDIA GPU and install `qwen-asr[vllm]` if available, otherwise
+   fall back to bare `qwen-asr` (transformers backend, slower).
+4. Download the Qwen3-ASR model into
+   `xtalk-bridge-service/pretrained_models/Qwen3-ASR-0.6B`.
+5. Start `qwen-asr-serve` on `127.0.0.1:8910`, the Python sidecar on
+   `127.0.0.1:7431`, and the Node bridge on `127.0.0.1:7430`.
+6. Tear everything down cleanly on `Ctrl-C`.
+
+Useful flags:
+
+```bash
+./scripts/start-all.sh --no-asr        # skip local ASR (fall back to cloud / .env)
+./scripts/start-all.sh --no-node       # skip the Node bridge
+./scripts/start-all.sh --no-sidecar    # skip the Python sidecar
+./scripts/start-all.sh --reinstall     # nuke and rebuild both venvs
+./scripts/start-all.sh --help
+```
+
+Useful env overrides:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SIDECAR_VENV` | `./.venv` | Path to the sidecar virtual environment |
+| `ASR_VENV` | `./.venv-qwen-asr` | Path to the qwen-asr virtual environment |
+| `QWEN_LOCAL_MODEL` | `Qwen/Qwen3-ASR-0.6B` | Model id / local dir |
+| `QWEN_ASR_SERVE_HOST` | `127.0.0.1` | Bind host for `qwen-asr-serve` |
+| `QWEN_ASR_SERVE_PORT` | `8910` | Bind port for `qwen-asr-serve` |
+| `QWEN_ASR_SERVE_GPU_MEM_UTIL` | `0.40` | vLLM `--gpu-memory-utilization`. **Cap**, not target — keeps ASR inside ~40% of the GPU so a TTS engine can coexist. Raise to `0.85` if you only run ASR. |
+| `QWEN_ASR_SERVE_MAX_MODEL_LEN` | `2048` | vLLM `--max-model-len`. Model default is 65536 (~7 GiB KV); ASR turns are short (< 30 s audio) so 2048 tokens is plenty. |
+| `QWEN_ASR_SERVE_MAX_NUM_SEQS` | `1` | vLLM `--max-num-seqs`. Single-stream ASR — no need to reserve KV slots for the default 256 concurrent requests. |
+| `QWEN_ASR_SERVE_ENFORCE_EAGER` | `1` | When non-zero, passes `--enforce-eager` to skip CUDA-graph capture (saves 1–3 GiB). |
+| `QWEN_ASR_SERVE_KV_CACHE_DTYPE` | `fp8` | vLLM `--kv-cache-dtype`. `fp8` halves KV memory with negligible WER impact; set to `auto` on GPUs without FP8 support (Pascal/Volta). |
+| `QWEN_ASR_SERVE_SWAP_SPACE` | `0` | vLLM `--swap-space` (GiB). `0` disables CPU paging reservation. |
+| `QWEN_ASR_SERVE_EXTRA_ARGS` | *(empty)* | Extra args appended to `qwen-asr-serve`. If you pass any of the flags above here directly, the launcher will skip its own version of that flag so your value wins. |
+
+Logs are written to `./logs/` (`qwen-asr-serve.log`, `xtalk-sidecar.log`,
+`openclaw-bridge.log`, plus install logs). PIDs are tracked in `./.run/`.
+
+If the launcher detects an existing healthy `qwen-asr-serve` on the configured
+port (`/v1/models` responds 200), it reuses it instead of starting a new one.
+
+> **Why `uv`?** The launcher uses `uv` instead of the system `python -m venv`
+> because some Linux distros ship Python without `ensurepip` /
+> `python3-venv`, which silently produces broken virtual environments. `uv`
+> bypasses that entirely and is also much faster. If the script fails to
+> auto-install `uv`, install it manually and rerun:
+>
+> ```bash
+> curl -LsSf https://astral.sh/uv/install.sh | sh
+> exec $SHELL -l
+> ./scripts/start-all.sh
+> ```
+
+#### Sharing the GPU with TTS
+
+The defaults above are tuned to leave headroom for a TTS model
+(`omnivoice` ≈ 3 GiB, `cosyvoice2` ≈ 4 GiB) on the same card. Rough budget on
+an 8 GiB GPU:
+
+| Slot | Approx. VRAM |
+| --- | --- |
+| Qwen3-ASR-0.6B weights (bf16) | ~1.3 GiB |
+| KV cache (`max-model-len=2048`, fp8, 1 seq) | ~0.3 GiB |
+| vLLM activations / overhead (eager, no CUDA graphs) | ~0.6 GiB |
+| **ASR total cap** (`gpu-memory-utilization=0.40`) | **~3.2 GiB** |
+| Free for TTS + framework | ~4.5 GiB |
+
+Suggested overrides for other GPU sizes:
+
+```bash
+# 6 GiB GPU, ASR-only (no TTS coexistence needed):
+QWEN_ASR_SERVE_GPU_MEM_UTIL=0.85 ./scripts/start-all.sh
+
+# 12 GiB GPU, give ASR more KV headroom for longer turns:
+QWEN_ASR_SERVE_GPU_MEM_UTIL=0.50 \
+QWEN_ASR_SERVE_MAX_MODEL_LEN=4096 \
+  ./scripts/start-all.sh
+
+# Ultra-tight (4 GiB) — drop FP8 if your GPU is pre-Ada/Hopper and use
+# the transformers backend instead by switching QWEN_LOCAL_BACKEND=transformers
+# in the sidecar .env (slower, no streaming, but ~1.5 GiB total).
+```
+
+### Manual setup
+
+If you prefer to run each component yourself, follow steps 1–7 below.
+
 ### 1. Install bridge dependencies
 
 ```bash
@@ -149,6 +263,15 @@ npm install
 ```
 
 ### 2. Create a Python environment for the sidecar
+
+Using `uv` (recommended):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh   # if not installed
+uv venv .venv
+uv pip install --python .venv/bin/python -r xtalk-bridge-service/requirements.txt
+source .venv/bin/activate
+```
 
 Using conda:
 
@@ -159,14 +282,21 @@ cd xtalk-bridge-service
 pip install -r requirements.txt
 ```
 
-Using venv:
+Using stock venv (requires `python3-venv` on Debian/Ubuntu):
 
 ```bash
+sudo apt-get install -y python3.12-venv python3.12-dev   # if missing
 python3 -m venv .venv
 source .venv/bin/activate
 cd xtalk-bridge-service
 pip install -r requirements.txt
 ```
+
+> Note: `omnivoice` and `qwen-asr` are **commented out** in
+> `requirements.txt` because their `transformers` version pins conflict.
+> If you want local Qwen3-ASR, see
+> [Optional Local Qwen3-ASR Mode](#optional-local-qwen3-asr-mode) below or
+> just use the one-click launcher.
 
 ### 3. Configure environment variables
 
@@ -243,6 +373,7 @@ X-Talk sidecar listening on ws://127.0.0.1:7431
 
 ```bash
 cd openclaw-extension-xtalk
+npm install
 npm run build
 npm start
 ```
@@ -270,6 +401,95 @@ Then:
 2. start recording
 3. speak normally
 4. interrupt the assistant while it is talking to test barge-in
+
+## Optional Local Qwen3-ASR Mode
+
+Local Qwen3-ASR-0.6B streaming runs entirely on your machine — no DashScope key,
+no cloud round-trip. The one-click launcher (above) sets this up for you;
+this section documents the moving parts for manual configuration and debugging.
+
+### Why a separate process?
+
+`omnivoice` (TTS) requires `transformers >= 5.3.0` and `qwen-asr` pins
+`transformers == 4.57.6`. They cannot share one virtual environment. The
+project solves this by running `qwen-asr-serve` in its own venv
+(`./.venv-qwen-asr`) and having the sidecar talk to it over the
+OpenAI-compatible HTTP API:
+
+```text
+[browser PCM] -> [sidecar (./.venv)] --HTTP /v1/audio/transcriptions--> [qwen-asr-serve (./.venv-qwen-asr)]
+```
+
+The sidecar exposes three backends via `QWEN_LOCAL_BACKEND`:
+
+| Backend | Use when | Pros | Cons |
+| --- | --- | --- | --- |
+| `vllm` | Local ASR only, no `omnivoice` | Lowest latency, single process | Conflicts with `omnivoice` |
+| `transformers` | Local ASR only, no `omnivoice` | Pure-python, no vLLM build | Slower |
+| `openai` | You also need `omnivoice` (split-process) | Both engines coexist | Adds an HTTP hop |
+
+The launcher picks `openai` automatically.
+
+### Manual setup (without the launcher)
+
+```bash
+# 1) Sidecar venv (omnivoice / DashScope / etc.)
+uv venv .venv
+uv pip install --python .venv/bin/python -r xtalk-bridge-service/requirements.txt
+
+# 2) Dedicated qwen-asr venv
+uv venv .venv-qwen-asr
+uv pip install --python .venv-qwen-asr/bin/python -U "qwen-asr[vllm]"   # or "qwen-asr" on CPU
+
+# 3) Pre-fetch the model (optional; qwen-asr-serve will download on demand)
+./.venv/bin/python xtalk-bridge-service/scripts/bootstrap_qwen3_asr.py \
+  --model Qwen/Qwen3-ASR-0.6B \
+  --target xtalk-bridge-service/pretrained_models/Qwen3-ASR-0.6B
+
+# 4) Launch the local ASR server (terminal A)
+./.venv-qwen-asr/bin/qwen-asr-serve Qwen/Qwen3-ASR-0.6B \
+  --host 127.0.0.1 --port 8910 --gpu-memory-utilization 0.5
+
+# 5) Point the sidecar at it (terminal B)
+export ASR_PROVIDER=qwen-local
+export QWEN_LOCAL_BACKEND=openai
+export QWEN_LOCAL_OPENAI_BASE_URL=http://127.0.0.1:8910/v1
+./.venv/bin/python xtalk-bridge-service/app.py
+```
+
+### Hardware
+
+| Mode | Min VRAM | Recommended GPU |
+| --- | --- | --- |
+| `vllm` backend | 4 GB | RTX 3060+ |
+| `transformers` backend | 3 GB | RTX 2060+ |
+| CPU only | — | not recommended for real-time |
+
+### Configuration
+
+All variables live under the `QWEN_LOCAL_*` prefix in
+`xtalk-bridge-service/.env` (see `.env.example` for the full block):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QWEN_LOCAL_MODEL` | `Qwen/Qwen3-ASR-0.6B` | Model id or local dir |
+| `QWEN_LOCAL_BACKEND` | `vllm` | `vllm`, `transformers`, or `openai` |
+| `QWEN_LOCAL_DEVICE` | `cuda:0` | Torch device (transformers backend) |
+| `QWEN_LOCAL_DTYPE` | `bfloat16` | `bfloat16`, `float16`, or `float32` |
+| `QWEN_LOCAL_LANGUAGE` | `zh` | Recognition language hint |
+| `QWEN_LOCAL_GPU_MEM_UTIL` | `0.5` | vLLM `gpu_memory_utilization` |
+| `QWEN_LOCAL_MAX_NEW_TOKENS` | `64` | Per-chunk generation cap |
+| `QWEN_LOCAL_STREAMING_CHUNK_MS` | `480` | Audio chunk size fed to the model |
+| `QWEN_LOCAL_UNFIXED_CHUNK_NUM` | `2` | Streaming-state lookahead chunks |
+| `QWEN_LOCAL_UNFIXED_TOKEN_NUM` | `5` | Streaming-state lookahead tokens |
+| `QWEN_LOCAL_CHUNK_SIZE_SEC` | `2.0` | Internal chunking window (seconds) |
+| `QWEN_LOCAL_PARTIAL_MIN_INTERVAL_MS` | `200` | Throttle for partial events |
+| `QWEN_LOCAL_ENERGY_THRESHOLD` | `200` | Front-end VAD energy gate |
+| `QWEN_LOCAL_SILENCE_LIMIT_MS` | `600` | Silence to trigger finalize |
+| `QWEN_LOCAL_MIN_SPEECH_MS` | `200` | Minimum speech to emit a turn |
+| `QWEN_LOCAL_OPENAI_BASE_URL` | `http://127.0.0.1:8910/v1` | HTTP endpoint for `openai` backend |
+| `QWEN_LOCAL_OPENAI_API_KEY` | `EMPTY` | API key forwarded to `qwen-asr-serve` |
+| `QWEN_LOCAL_OPENAI_TIMEOUT_S` | `30.0` | Request timeout for `openai` backend |
 
 ## Optional Local CosyVoice Mode
 
@@ -401,6 +621,72 @@ so the effective user-perceived gap between sentences approaches zero.
 - **Guidance scale**: keep `OMNIVOICE_GUIDANCE_SCALE` at `2.0`; higher values can
   introduce artefacts on short utterances.
 
+## Noise Robustness (Fast Enhancer)
+
+Background noise — HVAC, keyboard typing, distant TV, and most importantly
+the AI's own playback bleeding back through the mic — used to be the single
+worst source of false barge-in: the AI would get cut off mid-sentence by
+ambient sound. The bridge now ships a built-in **Fast Enhancer** front-end
+that denoises every microphone chunk *before* it ever reaches ASR or the
+barge-in detector.
+
+Under the hood it is the [k2-fsa sherpa-onnx GTCRN](https://k2-fsa.github.io/sherpa/onnx/speech-enhancement/models.html#gtcrn-simple)
+speech-denoiser model: < 1 MB on disk, single CPU thread, RTF ≈ 0.07
+(roughly 3 ms of added latency per 60 ms audio chunk). After denoising,
+stationary noise collapses toward zero RMS, which lets the existing
+energy-gate in [`xtalk-bridge-service/websocket_server.py`](xtalk-bridge-service/websocket_server.py)
+trivially reject it; partial transcripts produced from pure noise also stop,
+so the ASR-partial gate (`SIDECAR_BARGE_IN_REQUIRE_ASR_PARTIAL`) becomes a
+hard wall.
+
+### Setup
+
+The one-click launcher already installs `sherpa-onnx` from
+`requirements.txt`. To download the model file (one-time, ~520 KB):
+
+```bash
+cd xtalk-bridge-service
+python scripts/bootstrap_fast_enhancer.py
+```
+
+By default it lands at
+`xtalk-bridge-service/pretrained_models/fast-enhancer/gtcrn_simple.onnx`,
+which is exactly where `SPEECH_ENHANCER_MODEL` looks. The sidecar logs
+`Fast Enhancer ready in N ms` on startup when it's wired in.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SPEECH_ENHANCER_ENABLED` | `1` | Set to `0` to bypass denoising (useful for A/B tests) |
+| `SPEECH_ENHANCER_MODEL` | `pretrained_models/fast-enhancer/gtcrn_simple.onnx` | Path to the GTCRN ONNX file |
+| `SPEECH_ENHANCER_NUM_THREADS` | `1` | ONNX runtime intra-op threads |
+| `SPEECH_ENHANCER_PROVIDER` | `cpu` | `cpu` (recommended), `cuda`, or `coreml` |
+
+### Failure modes & how the bridge handles them
+
+- **Model file missing** → sidecar logs a warning and runs without
+  denoising; barge-in falls back to the previous heuristic-only behaviour.
+- **`sherpa-onnx` not installed** → same as above.
+- **Per-chunk inference exception** → that chunk is forwarded *raw*; the
+  audio path never goes silent.
+
+### Related barge-in tuning knobs (still respected)
+
+If denoising alone is not enough for an unusually loud environment, the
+existing post-denoise heuristics in `websocket_server.py` are still
+configurable via env vars (all optional):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SIDECAR_BARGE_IN_MIN_RMS` | `380` | Absolute RMS floor required to consider a chunk "voiced" |
+| `SIDECAR_BARGE_IN_NOISE_MULTIPLIER` | `3.6` | Multiplier above the running noise floor |
+| `SIDECAR_BARGE_IN_NOISE_MARGIN` | `180` | Additive margin above the noise floor |
+| `SIDECAR_BARGE_IN_CONSECUTIVE_CHUNKS` | `6` | Voiced chunks required before firing |
+| `SIDECAR_BARGE_IN_MIN_ACTIVE_MS` | `400` | Sustained-speech window required |
+| `SIDECAR_BARGE_IN_REQUIRE_ASR_PARTIAL` | `1` | Require non-empty ASR partial before allowing barge-in |
+| `SIDECAR_BARGE_IN_MIN_PARTIAL_CHARS` | `2` | Min characters in that partial to count as real speech |
+
 ## Configuration Reference
 
 ### Bridge process
@@ -422,7 +708,7 @@ Important variables:
 | Variable | Purpose |
 | --- | --- |
 | `DASHSCOPE_API_KEY` | DashScope credential for Qwen ASR and CosyVoice TTS |
-| `ASR_PROVIDER` | `qwen-realtime` or `whisper` |
+| `ASR_PROVIDER` | `qwen-realtime`, `qwen-local`, or `whisper` |
 | `QWEN_ASR_MODEL` | Recommended: `qwen3-asr-flash-realtime` |
 | `QWEN_ASR_URL` | Realtime WebSocket endpoint |
 | `QWEN_ASR_LANGUAGE` | Recognition language |
@@ -444,6 +730,10 @@ Important variables:
 | `OMNIVOICE_REF_AUDIO` | Path to 3–10 s reference WAV for voice cloning |
 | `OMNIVOICE_REF_TEXT` | Transcript of `OMNIVOICE_REF_AUDIO` (skips built-in ASR) |
 | `OMNIVOICE_INSTRUCT` | Voice-design attribute string, e.g. `"female, low pitch"` |
+| `SPEECH_ENHANCER_ENABLED` | `1` to denoise mic audio with GTCRN before ASR / barge-in (default `1`) |
+| `SPEECH_ENHANCER_MODEL` | Path to `gtcrn_simple.onnx` (default under `pretrained_models/fast-enhancer/`) |
+| `SPEECH_ENHANCER_NUM_THREADS` | ONNX runtime threads, `1` is enough |
+| `SPEECH_ENHANCER_PROVIDER` | `cpu` (recommended), `cuda`, or `coreml` |
 
 ## Turn Flow
 
@@ -498,6 +788,8 @@ Recommended reading order:
 - add transcript quality metrics and better noise rejection
 - add repeatable smoke tests for ASR and TTS
 - support remote deployment of the speech sidecar
+- expose Fast Enhancer through a streaming (per-frame) API once sherpa-onnx
+  ships the Python binding for `OnlineSpeechDenoiser`
 
 ## License
 
