@@ -1055,6 +1055,46 @@ def _normalize_qwen_language(language: str | None) -> str | None:
     return _LANGUAGE_CODE_TO_NAME.get(code, language)
 
 
+_QWEN_ASR_TEXT_TAG_RE = re.compile(r"<asr_text>", re.IGNORECASE)
+_QWEN_LANGUAGE_PREFIX_RE = re.compile(
+    r"^\s*language\s+(?:none|"
+    + "|".join(sorted(set(_LANGUAGE_CODE_TO_NAME.values())))
+    + r")(?=\s|<|$|[^\x00-\x7f])",
+    re.IGNORECASE,
+)
+
+
+def _clean_qwen_asr_text(raw: str | None) -> str:
+    """Normalize Qwen3-ASR raw decoder text to transcript-only text."""
+    if raw is None:
+        return ""
+
+    text = str(raw).strip()
+    if not text:
+        return ""
+
+    # Older qwen-asr/vLLM paths may return Whisper-style language sentinels.
+    text = re.sub(r"^\s*<\|[^|]+\|>\s*", "", text).strip()
+
+    # Qwen3-ASR can emit metadata in the form:
+    #   language Chinese<asr_text>你好
+    #   language None<asr_text>你好
+    # The model's own parser keeps the text after the tag; mirror that here so
+    # split-process mode never forwards metadata into the OpenClaw turn.
+    match = _QWEN_ASR_TEXT_TAG_RE.search(text)
+    if match:
+        meta = text[: match.start()]
+        body = text[match.end() :].strip()
+        if _QWEN_LANGUAGE_PREFIX_RE.search(meta):
+            return body
+        return body or meta.strip()
+
+    # Be defensive for malformed outputs missing the tag but still starting
+    # with the language preamble.
+    text = _QWEN_LANGUAGE_PREFIX_RE.sub("", text, count=1).strip()
+    return text
+
+
 class Qwen3LocalASREngine:
     """Local open-source Qwen3-ASR engine (vLLM streaming or transformers).
 
@@ -1391,7 +1431,7 @@ class Qwen3LocalASRSession:
         chunk = np.concatenate(self._buffer)
         self._reset_buffers()
         await asyncio.to_thread(self._streaming_transcribe, chunk)
-        text = (getattr(self._state, "text", "") or "").strip()
+        text = _clean_qwen_asr_text(getattr(self._state, "text", ""))
         if not text or text == self._last_partial_text:
             return
         now_ms = time_ms()
@@ -1426,7 +1466,7 @@ class Qwen3LocalASRSession:
                 self._reset_buffers()
                 await asyncio.to_thread(self._streaming_transcribe, chunk)
             await asyncio.to_thread(self._finish_streaming)
-            text = (getattr(self._state, "text", "") or "").strip()
+            text = _clean_qwen_asr_text(getattr(self._state, "text", ""))
             self._state = None
         else:
             # transformers / openai backends: one-shot transcribe over the
@@ -1473,7 +1513,7 @@ class Qwen3LocalASRSession:
         if not results:
             return ""
         text = getattr(results[0], "text", "") or ""
-        return text.strip()
+        return _clean_qwen_asr_text(text)
 
     def _openai_transcribe(self, audio: np.ndarray) -> str:
         """Send the buffered utterance to an external qwen-asr-serve instance.
@@ -1528,6 +1568,4 @@ class Qwen3LocalASRSession:
             content = data["choices"][0]["message"]["content"]
         except Exception as exc:
             raise ASRUnavailableError(f"qwen-asr-serve returned malformed response: {exc}") from exc
-        # qwen-asr formats the content as "<|Chinese|>你好。"; strip the prefix.
-        text = re.sub(r"^\s*<\|[^|]+\|>\s*", "", content or "").strip()
-        return text
+        return _clean_qwen_asr_text(content)
