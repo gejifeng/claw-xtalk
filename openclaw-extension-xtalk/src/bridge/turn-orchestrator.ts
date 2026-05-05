@@ -10,6 +10,12 @@ import { HermesAgentAdapter } from "../adapters/openclaw-agent-adapter";
 import type { AsrTiming } from "../types/protocol";
 
 const ASR_FILLER_RE = /^(?:嗯+|啊+|哦+|呃+|额+|唉+|哎+|诶+|欸+|噢+|哼+|嗯哼+|啊哈+)$/;
+const SENTENCE_END_RE = /[。？！.?!]/;
+const FIRST_CHUNK_DEADLINE_MS = 150;
+const FIRST_CHUNK_RETRY_MS = 75;
+const FIRST_CHUNK_MAX_WAIT_MS = 650;
+const FIRST_FORCED_MIN_CHARS = 6;
+const FIRST_FORCED_MIN_CHARS_AFTER_MAX_WAIT = 2;
 
 function normalizeAsrText(text: string): string {
   return text
@@ -25,7 +31,7 @@ function isIgnorableUtterance(text: string): boolean {
 }
 
 export class TurnOrchestrator extends EventEmitter {
-  // Tracks the active 150 ms forced-flush timer per browser session.
+  // Tracks the active first-TTS-chunk deadline timer per browser session.
   private readonly _firstChunkTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(
@@ -98,22 +104,7 @@ export class TurnOrchestrator extends EventEmitter {
     if (isFirstDelta) {
       console.log(`[TurnOrchestrator] first delta received bid=${browserSessionId}`);
       this.registry.setTurnState(browserSessionId, "Speaking");
-      // Start a 150 ms deadline: if no sentence boundary arrives in time, force
-      // dispatch whatever is buffered so TTS can start without waiting for
-      // punctuation.  The timer is cancelled the moment the first chunk is sent.
-      const timer = setTimeout(() => {
-        this._firstChunkTimers.delete(browserSessionId);
-        const m = this.registry.get(browserSessionId);
-        if (!m?.currentTurn || m.currentTurn.turnId !== turnId) return;
-        if (m.currentTurn.firstChunkSent) return;
-        const buffered = m.currentTurn.pendingTTSBuffer;
-        if (buffered.trim().length === 0) return;
-        m.currentTurn.pendingTTSBuffer = "";
-        m.currentTurn.firstChunkSent = true;
-        console.log(`[TurnOrchestrator] 150ms deadline flush bid=${browserSessionId} chars=${buffered.length}`);
-        this.xtalk.ttsSendChunk(m.xtalkSessionId, turnId, buffered);
-      }, 150);
-      this._firstChunkTimers.set(browserSessionId, timer);
+      this._scheduleFirstChunkDeadline(browserSessionId, turnId);
     }
     this.emit("event", { kind: "AGENT_DELTA", browserSessionId, turnId, text: delta });
 
@@ -130,11 +121,7 @@ export class TurnOrchestrator extends EventEmitter {
         if (!mapping.currentTurn.firstChunkSent) {
           mapping.currentTurn.firstChunkSent = true;
           // Cancel the deadline timer – a boundary was found in time.
-          const timer = this._firstChunkTimers.get(browserSessionId);
-          if (timer !== undefined) {
-            clearTimeout(timer);
-            this._firstChunkTimers.delete(browserSessionId);
-          }
+          this._cancelFirstChunkDeadline(browserSessionId);
         }
         this.xtalk.ttsSendChunk(mapping.xtalkSessionId, turnId, chunk);
       }
@@ -151,7 +138,9 @@ export class TurnOrchestrator extends EventEmitter {
     const remaining = mapping.currentTurn.pendingTTSBuffer + unsentSuffix;
     mapping.currentTurn.assistantText = final;
     mapping.currentTurn.pendingTTSBuffer = "";
+    this._cancelFirstChunkDeadline(browserSessionId);
     if (remaining.trim().length > 0) {
+      mapping.currentTurn.firstChunkSent = true;
       this.xtalk.ttsSendChunk(mapping.xtalkSessionId, turnId, remaining);
     }
     this.xtalk.ttsFlush(mapping.xtalkSessionId, turnId);
@@ -176,11 +165,7 @@ export class TurnOrchestrator extends EventEmitter {
     const { xtalkSessionId } = mapping;
 
     // Cancel any pending first-chunk deadline timer before the turn is replaced.
-    const pendingTimer = this._firstChunkTimers.get(browserSessionId);
-    if (pendingTimer !== undefined) {
-      clearTimeout(pendingTimer);
-      this._firstChunkTimers.delete(browserSessionId);
-    }
+    this._cancelFirstChunkDeadline(browserSessionId);
 
     this.registry.setTurnState(browserSessionId, "Interrupted");
     this.xtalk.stopPlayback(xtalkSessionId, turnId);
@@ -203,5 +188,54 @@ export class TurnOrchestrator extends EventEmitter {
     const newTurn = this.registry.newTurn(browserSessionId);
     this.registry.setTurnState(browserSessionId, "Listening");
     this.xtalk.notifyNewTurn(mapping.xtalkSessionId, newTurn.turnId);
+  }
+
+  private _scheduleFirstChunkDeadline(
+    browserSessionId: string,
+    turnId: string,
+    startedAt = Date.now(),
+    delayMs = FIRST_CHUNK_DEADLINE_MS,
+  ): void {
+    if (this._firstChunkTimers.has(browserSessionId)) return;
+    const timer = setTimeout(() => {
+      this._firstChunkTimers.delete(browserSessionId);
+      this._handleFirstChunkDeadline(browserSessionId, turnId, startedAt);
+    }, delayMs);
+    this._firstChunkTimers.set(browserSessionId, timer);
+  }
+
+  private _handleFirstChunkDeadline(browserSessionId: string, turnId: string, startedAt: number): void {
+    const mapping = this.registry.get(browserSessionId);
+    if (!mapping?.currentTurn || mapping.currentTurn.turnId !== turnId) return;
+    if (mapping.currentTurn.firstChunkSent) return;
+
+    const buffered = mapping.currentTurn.pendingTTSBuffer;
+    const elapsedMs = Date.now() - startedAt;
+    if (!this._isSafeFirstForcedChunk(buffered, elapsedMs)) {
+      this._scheduleFirstChunkDeadline(browserSessionId, turnId, startedAt, FIRST_CHUNK_RETRY_MS);
+      return;
+    }
+
+    mapping.currentTurn.pendingTTSBuffer = "";
+    mapping.currentTurn.firstChunkSent = true;
+    console.log(
+      `[TurnOrchestrator] first-chunk deadline flush bid=${browserSessionId} chars=${buffered.length} elapsed=${elapsedMs}ms`,
+    );
+    this.xtalk.ttsSendChunk(mapping.xtalkSessionId, turnId, buffered);
+  }
+
+  private _isSafeFirstForcedChunk(text: string, elapsedMs: number): boolean {
+    const trimmedLength = text.trim().length;
+    if (trimmedLength === 0) return false;
+    if (SENTENCE_END_RE.test(text)) return true;
+    if (trimmedLength >= FIRST_FORCED_MIN_CHARS) return true;
+    return elapsedMs >= FIRST_CHUNK_MAX_WAIT_MS && trimmedLength >= FIRST_FORCED_MIN_CHARS_AFTER_MAX_WAIT;
+  }
+
+  private _cancelFirstChunkDeadline(browserSessionId: string): void {
+    const timer = this._firstChunkTimers.get(browserSessionId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this._firstChunkTimers.delete(browserSessionId);
   }
 }
