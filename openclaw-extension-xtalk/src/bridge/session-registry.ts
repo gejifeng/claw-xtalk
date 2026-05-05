@@ -1,6 +1,6 @@
 // -----------------------------------------------------------------------
 // SessionRegistry – manages the three-way ID mapping
-// browserSessionId 1:1 xtalkSessionId, N:1 openclawSessionKey
+// browserSessionId 1:1 xtalkSessionId, N:1 hermesSessionId
 // -----------------------------------------------------------------------
 import { v4 as uuidv4 } from "uuid";
 import { SessionMapping, TurnContext, TurnState } from "../types/state";
@@ -11,13 +11,13 @@ export class SessionRegistry {
   /** Register a new browser connection. Returns the created mapping. */
   register(
     browserSessionId: string,
-    openclawSessionKey = `xtalk:${browserSessionId}`,
+    hermesSessionId = `xtalk:${browserSessionId}`,
   ): SessionMapping {
     const xtalkSessionId = `x-${uuidv4()}`;
     const mapping: SessionMapping = {
       browserSessionId,
       xtalkSessionId,
-      openclawSessionKey,
+      hermesSessionId,
       currentTurn: null,
       connectedAt: Date.now(),
     };

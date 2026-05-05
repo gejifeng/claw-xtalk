@@ -10,7 +10,7 @@ import { ChunkingPolicy } from "./bridge/chunking-policy";
 import { TurnOrchestrator } from "./bridge/turn-orchestrator";
 import { InterruptController } from "./bridge/interrupt-controller";
 import { XtalkAdapter } from "./adapters/xtalk-adapter";
-import { OpenclawAgentAdapter } from "./adapters/openclaw-agent-adapter";
+import { HermesAgentAdapter } from "./adapters/openclaw-agent-adapter";
 import { mountRoutes } from "./web/routes";
 import type { XtalkAdapterEvent } from "./adapters/xtalk-adapter";
 
@@ -20,7 +20,7 @@ const SIDECAR_WS_URL   = process.env["SIDECAR_WS_URL"] ?? "ws://127.0.0.1:7431";
 // ---- Component wiring ---------------------------------------------------
 const registry     = new SessionRegistry();
 const chunking     = new ChunkingPolicy();
-const agentAdapter = new OpenclawAgentAdapter();
+const agentAdapter = new HermesAgentAdapter();
 const xtalk        = new XtalkAdapter(SIDECAR_WS_URL);
 const orchestrator = new TurnOrchestrator(registry, xtalk, agentAdapter, chunking);
 const interruptCtrl = new InterruptController(registry, orchestrator);

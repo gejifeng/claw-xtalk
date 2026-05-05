@@ -29,7 +29,8 @@ export interface TurnContext {
 export interface SessionMapping {
   browserSessionId: string;
   xtalkSessionId: string;
-  openclawSessionKey: string;
+  /** Stable key used to look up / create the Hermes conversation in state.db */
+  hermesSessionId: string;
   currentTurn: TurnContext | null;
   connectedAt: number;
 }

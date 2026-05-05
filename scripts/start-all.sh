@@ -7,7 +7,8 @@
 #
 #   1) qwen-asr-serve        — local Qwen3-ASR HTTP server   (separate venv)
 #   2) xtalk-bridge-service  — Python sidecar (ASR/TTS proxy) (sidecar venv)
-#   3) openclaw-extension    — Node.js bridge + browser UI    (npm)
+#   3) hermes-bridge         — Node.js bridge + browser UI    (npm)
+#                              Talks to Hermes Agent over HTTP chat completions
 #
 # Why split venvs?
 #   `omnivoice` requires transformers >= 5.3 and `qwen-asr` pins
@@ -111,6 +112,54 @@ if [[ -f "${SIDECAR_DIR}/.env" ]]; then
 fi
 SIDECAR_HOST="${SIDECAR_HOST:-127.0.0.1}"
 SIDECAR_PORT="${SIDECAR_PORT:-7431}"
+
+# ── Load Hermes config so the Node bridge inherits gateway settings ───────────
+# Reads ~/.hermes/config.yaml (YAML) to export gateway host/port and model,
+# then ~/.hermes/.env for API keys.  Process-env values take precedence over
+# both files, matching the priority order in HermesAgentAdapter.
+HERMES_CONFIG="${HERMES_CONFIG:-${HOME}/.hermes/config.yaml}"
+HERMES_STATE_DB="${HERMES_STATE_DB:-${HOME}/.hermes/state.db}"
+export HERMES_CONFIG HERMES_STATE_DB
+
+_parse_hermes_config() {
+  # Minimal YAML parser: extracts gateway.port, gateway.host, and model.
+  # Requires only standard bash + grep — no python or yq dependency.
+  if [[ ! -f "${HERMES_CONFIG}" ]]; then return 0; fi
+  local in_gateway=0
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^gateway: ]]; then in_gateway=1; continue; fi
+    if [[ $in_gateway -eq 1 && "$line" =~ ^[^[:space:]] && ! "$line" =~ ^gateway: ]]; then
+      in_gateway=0
+    fi
+    if [[ $in_gateway -eq 1 ]]; then
+      if [[ "$line" =~ ^[[:space:]]+host:[[:space:]]*(.+) ]]; then
+        export HERMES_GATEWAY_HOST="${BASH_REMATCH[1]// /}"
+      fi
+      if [[ "$line" =~ ^[[:space:]]+port:[[:space:]]*([0-9]+) ]]; then
+        export HERMES_GATEWAY_PORT="${BASH_REMATCH[1]}"
+      fi
+    fi
+    if [[ "$line" =~ ^model:[[:space:]]*(.+) ]]; then
+      export HERMES_MODEL="${BASH_REMATCH[1]// /}"
+    fi
+  done < "${HERMES_CONFIG}"
+}
+_parse_hermes_config
+
+# Load ~/.hermes/.env for API key (only if key not already set)
+if [[ -f "${HOME}/.hermes/.env" && -z "${HERMES_API_KEY:-}" ]]; then
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^HERMES_API_KEY=(.+)$ ]]; then
+      export HERMES_API_KEY="${BASH_REMATCH[1]}"
+      break
+    fi
+  done < "${HOME}/.hermes/.env"
+fi
+
+log "Hermes config     : ${HERMES_CONFIG}"
+log "Hermes state db   : ${HERMES_STATE_DB}"
+log "Hermes gateway    : ${HERMES_GATEWAY_HOST:-localhost}:${HERMES_GATEWAY_PORT:-80}"
 
 # ── Process tracking ─────────────────────────────────────────────────────────
 declare -a CHILD_PIDS=()
@@ -596,9 +645,9 @@ if (( START_NODE )); then
           || die "npm install failed; see ${LOG_DIR}/node-install.log"
       fi
     fi
-    spawn "openclaw-bridge" "${LOG_DIR}/openclaw-bridge.log" \
+    spawn "hermes-bridge" "${LOG_DIR}/hermes-bridge.log" \
       bash -c "cd '${NODE_DIR}' && exec npm start" \
-      || die "Node bridge failed to start"
+      || die "Node bridge (Hermes) failed to start"
   fi
 fi
 

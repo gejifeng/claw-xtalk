@@ -23,7 +23,7 @@ export interface AsrTiming {
 
 // ── Extension → Browser ─────────────────────────────────────────────────
 export type ExtToBrowserMsg =
-  | { type: "session.ready"; xtalkSessionId: string; openclawSessionKey: string }
+  | { type: "session.ready"; xtalkSessionId: string; hermesSessionId: string; openclawSessionKey: string }
   | { type: "asr.partial"; text: string }
   | { type: "asr.final"; text: string; timing?: AsrTiming }
   | { type: "asr.ignored"; text: string; reason: string }

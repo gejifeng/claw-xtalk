@@ -92,7 +92,9 @@ export function mountRoutes(
           safeSend(ws, {
             type: "session.ready",
             xtalkSessionId: mapping.xtalkSessionId,
-            openclawSessionKey: mapping.openclawSessionKey,
+            hermesSessionId: mapping.hermesSessionId,
+            // backward-compat alias: browser UI debug panel reads this field name
+            openclawSessionKey: mapping.hermesSessionId,
           });
           console.log(
             `[routes] session init bid=${browserSessionId} xid=${mapping.xtalkSessionId} turn=${turn.turnId}`,
